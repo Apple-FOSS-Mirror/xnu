@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -91,7 +91,8 @@
 #endif /* DIAGNOSTIC */
 #include <kern/task.h>
 #include <kern/zalloc.h>
-#include <kern/lock.h>
+#include <kern/locks.h>
+#include <kern/thread.h>
 
 #include <sys/fslog.h>		/* fslog_io_error() */
 
@@ -110,12 +111,6 @@
 
 #include <sys/sdt.h>
 #include <sys/cprotect.h>
-
-
-#if BALANCE_QUEUES
-static __inline__ void bufqinc(int q);
-static __inline__ void bufqdec(int q);
-#endif
 
 int	bcleanbuf(buf_t bp, boolean_t discard);
 static int	brecover_data(buf_t bp);
@@ -138,8 +133,8 @@ static buf_t	buf_create_shadow_internal(buf_t bp, boolean_t force_copy,
 __private_extern__ int  bdwrite_internal(buf_t, int);
 
 /* zone allocated buffer headers */
-static void	bufzoneinit(void) __attribute__((section("__TEXT, initcode")));
-static void	bcleanbuf_thread_init(void) __attribute__((section("__TEXT, initcode")));
+static void	bufzoneinit(void);
+static void	bcleanbuf_thread_init(void);
 static void	bcleanbuf_thread(void);
 
 static zone_t	buf_hdr_zone;
@@ -190,17 +185,6 @@ buf_timestamp(void)
 /*
  * Insq/Remq for the buffer free lists.
  */
-#if BALANCE_QUEUES
-#define	binsheadfree(bp, dp, whichq)	do { \
-				    TAILQ_INSERT_HEAD(dp, bp, b_freelist); \
-					bufqinc((whichq));	\
-				} while (0)
-
-#define	binstailfree(bp, dp, whichq)	do { \
-				    TAILQ_INSERT_TAIL(dp, bp, b_freelist); \
-					bufqinc((whichq));	\
-				} while (0)
-#else
 #define	binsheadfree(bp, dp, whichq)	do { \
 				    TAILQ_INSERT_HEAD(dp, bp, b_freelist); \
 				} while (0)
@@ -208,8 +192,6 @@ buf_timestamp(void)
 #define	binstailfree(bp, dp, whichq)	do { \
 				    TAILQ_INSERT_TAIL(dp, bp, b_freelist); \
 				} while (0)
-#endif
-
 
 #define BHASHENTCHECK(bp)	\
 	if ((bp)->b_hash.le_prev != (struct buf **)0xdeadbeef)	\
@@ -452,6 +434,18 @@ bufattr_free(bufattr_t bap) {
 		FREE(bap, M_TEMP);
 }
 
+bufattr_t
+bufattr_dup(bufattr_t bap) {
+	bufattr_t new_bufattr;
+	MALLOC(new_bufattr, bufattr_t, sizeof(struct bufattr), M_TEMP, M_WAITOK);
+	if (new_bufattr == NULL)
+		return NULL;
+
+	/* Copy the provided one into the new copy */
+	memcpy (new_bufattr, bap, sizeof(struct bufattr));
+	return new_bufattr;
+}
+
 int
 bufattr_rawencrypted(bufattr_t bap) {
 	if ( (bap->ba_flags & BA_RAW_ENCRYPTED_IO) )
@@ -461,7 +455,12 @@ bufattr_rawencrypted(bufattr_t bap) {
 
 int
 bufattr_throttled(bufattr_t bap) {
-	if ( (bap->ba_flags & BA_THROTTLED_IO) )
+	return (GET_BUFATTR_IO_TIER(bap));
+}
+
+int
+bufattr_passive(bufattr_t bap) {
+	if ( (bap->ba_flags & BA_PASSIVE) )
 		return 1;
 	return 0;
 }
@@ -480,17 +479,16 @@ bufattr_meta(bufattr_t bap) {
 	return 0;
 }
 
+void
+bufattr_markmeta(bufattr_t bap) {
+	SET(bap->ba_flags,  BA_META);
+}
+
 int
-#if !CONFIG_EMBEDDED
 bufattr_delayidlesleep(bufattr_t bap) 
-#else /* !CONFIG_EMBEDDED */
-bufattr_delayidlesleep(__unused bufattr_t bap) 
-#endif /* !CONFIG_EMBEDDED */
 {
-#if !CONFIG_EMBEDDED
 	if ( (bap->ba_flags & BA_DELAYIDLESLEEP) )
 		return 1;
-#endif /* !CONFIG_EMBEDDED */
 	return 0;
 }
 
@@ -507,6 +505,42 @@ buf_markstatic(buf_t bp __unused) {
 int
 buf_static(buf_t bp) {
     if ( (bp->b_flags & B_STATICCONTENT) )
+        return 1;
+    return 0;
+}
+
+void 
+bufattr_markgreedymode(bufattr_t bap) {
+	SET(bap->ba_flags, BA_GREEDY_MODE);
+}
+
+int
+bufattr_greedymode(bufattr_t bap) {
+    if ( (bap->ba_flags & BA_GREEDY_MODE) )
+        return 1;
+    return 0;
+}
+
+void 
+bufattr_markisochronous(bufattr_t bap) {
+	SET(bap->ba_flags, BA_ISOCHRONOUS);
+}
+
+int
+bufattr_isochronous(bufattr_t bap) {
+    if ( (bap->ba_flags & BA_ISOCHRONOUS) )
+        return 1;
+    return 0;
+}
+
+void 
+bufattr_markquickcomplete(bufattr_t bap) {
+	SET(bap->ba_flags, BA_QUICK_COMPLETE);
+}
+
+int
+bufattr_quickcomplete(bufattr_t bap) {
+    if ( (bap->ba_flags & BA_QUICK_COMPLETE) )
         return 1;
     return 0;
 }
@@ -1196,7 +1230,7 @@ buf_strategy(vnode_t devvp, void *ap)
         errno_t error;
 #if CONFIG_DTRACE
 	int dtrace_io_start_flag = 0;	 /* We only want to trip the io:::start
-					  * probe once, with the true phisical
+					  * probe once, with the true physical
 					  * block in place (b_blkno)
 					  */
 
@@ -1304,6 +1338,7 @@ buf_strategy(vnode_t devvp, void *ap)
 			 * we have only issued a single I/O.
 			 */
 			bufattr_setcpoff (&(bp->b_attr), (u_int64_t)f_offset);
+			CP_DEBUG((CPDBG_OFFSET_IO | DBG_FUNC_NONE), (uint32_t) f_offset, (uint32_t) bp->b_lblkno, (uint32_t) bp->b_blkno, (uint32_t) bp->b_bcount, 0);
 		}
 	}
 #endif
@@ -1314,9 +1349,11 @@ buf_strategy(vnode_t devvp, void *ap)
 	 * means that the I/O is properly set
 	 * up to be a multiple of the page size, or
 	 * we were able to successfully set up the
-	 * phsyical block mapping
+	 * physical block mapping
 	 */
-	return (VOCALL(devvp->v_op, VOFFSET(vnop_strategy), ap));
+	error = VOCALL(devvp->v_op, VOFFSET(vnop_strategy), ap);
+	DTRACE_FSINFO(strategy, vnode_t, vp);
+	return (error);
 }
 
 
@@ -1801,9 +1838,6 @@ bremfree_locked(buf_t bp)
 	}
 	TAILQ_REMOVE(dp, bp, b_freelist);
 
-#if BALANCE_QUEUES
-	bufqdec(whichq);
-#endif
 	if (whichq == BQ_LAUNDRY)
 	        blaundrycnt--;
 
@@ -1981,16 +2015,7 @@ bufinit(void)
 		panic("Couldn't register buffer cache callout for vm pressure!\n");
 	}
 
-#if BALANCE_QUEUES
-	{
-	static void bufq_balance_thread_init(void) __attribute__((section("__TEXT, initcode")));
-	/* create a thread to do dynamic buffer queue balancing */
-	bufq_balance_thread_init();
-	}
-#endif /* notyet */
 }
-
-
 
 /*
  * Zones for the meta data buffers
@@ -2082,8 +2107,9 @@ bio_doread(vnode_t vp, daddr64_t blkno, int size, kauth_cred_t cred, int async, 
 		trace(TR_BREADMISS, pack(vp, size), blkno);
 
 		/* Pay for the read. */
-		if (p && p->p_stats) 
+		if (p && p->p_stats) { 
 			OSIncrementAtomicLong(&p->p_stats->p_ru.ru_inblock);		/* XXX */
+		}
 
 		if (async) {
 		        /*
@@ -2217,9 +2243,10 @@ buf_bwrite(buf_t bp)
 		 */
 		if (wasdelayed)
 			buf_reassign(bp, vp);
-		else
-		if (p && p->p_stats) 
-			OSIncrementAtomicLong(&p->p_stats->p_ru.ru_oublock);	/* XXX */
+		else 
+			if (p && p->p_stats) {
+				OSIncrementAtomicLong(&p->p_stats->p_ru.ru_oublock);	/* XXX */
+			}
 	}
 	trace(TR_BUFWRITE, pack(vp, bp->b_bcount), bp->b_lblkno);
 
@@ -2243,8 +2270,9 @@ buf_bwrite(buf_t bp)
 		if (wasdelayed)
 			buf_reassign(bp, vp);
 		else
-		if (p && p->p_stats) 
-			OSIncrementAtomicLong(&p->p_stats->p_ru.ru_oublock);	/* XXX */
+			if (p && p->p_stats) { 
+				OSIncrementAtomicLong(&p->p_stats->p_ru.ru_oublock);	/* XXX */
+			}
 
 		/* Release the buffer. */
 		// XXXdbg - only if the unused bit is set
@@ -2299,8 +2327,9 @@ bdwrite_internal(buf_t bp, int return_error)
 	 */
 	if (!ISSET(bp->b_flags, B_DELWRI)) {
 		SET(bp->b_flags, B_DELWRI);
-		if (p && p->p_stats) 
+		if (p && p->p_stats) { 
 			OSIncrementAtomicLong(&p->p_stats->p_ru.ru_oublock);	/* XXX */
+		}
 		OSAddAtomicLong(1, &nbdwrite);
 		buf_reassign(bp, vp);
 	}
@@ -2489,10 +2518,9 @@ buf_brelse_shadow(buf_t bp)
 		}
 	}
 	lck_mtx_unlock(buf_mtxp);
-	
-	if (need_wakeup) {
+
+	if (need_wakeup)
 		wakeup(bp_head);
-	}
 
 #ifdef BUF_MAKE_PRIVATE	
 	if (bp == bp_data && data_ref == 0)
@@ -2819,6 +2847,7 @@ incore_locked(vnode_t vp, daddr64_t blkno, struct bufhashhdr *dp)
 	}
 	return (NULL);
 }
+
 
 void
 buf_wait_for_shadow_io(vnode_t vp, daddr64_t blkno)
@@ -3208,6 +3237,80 @@ buf_clear_redundancy_flags(buf_t bp, uint32_t flags)
 	CLR(bp->b_redundancy_flags, flags);
 }
 
+
+
+static void *
+recycle_buf_from_pool(int nsize)
+{
+	buf_t	bp;
+	void	*ptr = NULL;
+
+	lck_mtx_lock_spin(buf_mtxp);
+
+	TAILQ_FOREACH(bp, &bufqueues[BQ_META], b_freelist) {
+		if (ISSET(bp->b_flags, B_DELWRI) || bp->b_bufsize != nsize)
+			continue;
+		ptr = (void *)bp->b_datap;
+		bp->b_bufsize = 0;
+
+		bcleanbuf(bp, TRUE);
+		break;
+	}
+	lck_mtx_unlock(buf_mtxp);
+
+	return (ptr);
+}
+
+
+
+int zalloc_nopagewait_failed = 0;
+int recycle_buf_failed = 0;
+
+static void *
+grab_memory_for_meta_buf(int nsize)
+{
+	zone_t z;
+	void *ptr;
+	boolean_t was_vmpriv;
+
+	z = getbufzone(nsize);
+
+	/*
+	 * make sure we're NOT priviliged so that
+	 * if a vm_page_grab is needed, it won't
+	 * block if we're out of free pages... if
+	 * it blocks, then we can't honor the
+	 * nopagewait request
+	 */
+	was_vmpriv = set_vm_privilege(FALSE);
+
+	ptr = zalloc_nopagewait(z);
+
+	if (was_vmpriv == TRUE)
+		set_vm_privilege(TRUE);
+
+	if (ptr == NULL) {
+
+		zalloc_nopagewait_failed++;
+
+		ptr = recycle_buf_from_pool(nsize);
+
+		if (ptr == NULL) {
+
+			recycle_buf_failed++;
+
+			if (was_vmpriv == FALSE)
+				set_vm_privilege(TRUE);
+
+			ptr = zalloc(z);
+
+			if (was_vmpriv == FALSE)
+				set_vm_privilege(FALSE);
+		}
+	}
+	return (ptr);
+}
+
 /*
  * With UBC, there is no need to expand / shrink the file data 
  * buffer. The VM uses the same pages, hence no waste.
@@ -3233,7 +3336,6 @@ allocbuf(buf_t bp, int size)
 		panic("allocbuf: buffer larger than MAXBSIZE requested");
 
 	if (ISSET(bp->b_flags, B_META)) {
-		zone_t zprev, z;
 		int    nsize = roundup(size, MINMETA);
 
 		if (bp->b_datap) {
@@ -3241,14 +3343,16 @@ allocbuf(buf_t bp, int size)
 
 			if (ISSET(bp->b_flags, B_ZALLOC)) {
 			        if (bp->b_bufsize < nsize) {
+				        zone_t zprev;
+
 				        /* reallocate to a bigger size */
 
 				        zprev = getbufzone(bp->b_bufsize);
 					if (nsize <= MAXMETA) {
 					        desired_size = nsize;
-						z = getbufzone(nsize);
+
 						/* b_datap not really a ptr */
-						*(void **)(&bp->b_datap) = zalloc(z);
+						*(void **)(&bp->b_datap) = grab_memory_for_meta_buf(nsize);
 					} else {
 					        bp->b_datap = (uintptr_t)NULL;
 					        kmem_alloc_kobject(kernel_map, (vm_offset_t *)&bp->b_datap, desired_size);
@@ -3275,9 +3379,9 @@ allocbuf(buf_t bp, int size)
 			/* new allocation */
 			if (nsize <= MAXMETA) {
 				desired_size = nsize;
-				z = getbufzone(nsize);
+
 				/* b_datap not really a ptr */
-				*(void **)(&bp->b_datap) = zalloc(z);
+				*(void **)(&bp->b_datap) = grab_memory_for_meta_buf(nsize);
 				SET(bp->b_flags, B_ZALLOC);
 			} else
 				kmem_alloc_kobject(kernel_map, (vm_offset_t *)&bp->b_datap, desired_size);
@@ -3555,6 +3659,8 @@ bcleanbuf(buf_t bp, boolean_t discard)
 	trace(TR_BRELSE, pack(bp->b_vp, bp->b_bufsize), bp->b_lblkno);
 
 	buf_release_credentials(bp);
+	
+	bp->b_redundancy_flags = 0;
 
 	/* If discarding, just move to the empty queue */
 	if (discard) {
@@ -3783,13 +3889,12 @@ buf_biowait(buf_t bp)
  * (for swap pager, that puts swap buffers on the free lists (!!!),
  * for the vn device, that puts malloc'd buffers on the free lists!)
  */
-extern struct timeval priority_IO_timestamp_for_root;
-extern int hard_throttle_on_root;
 
 void
 buf_biodone(buf_t bp)
 {
 	mount_t mp;
+	struct bufattr *bap;
 	
 	KERNEL_DEBUG((FSDBG_CODE(DBG_FSRW, 387)) | DBG_FUNC_START,
 		     bp, bp->b_datap, bp->b_flags, 0, 0);
@@ -3797,9 +3902,7 @@ buf_biodone(buf_t bp)
 	if (ISSET(bp->b_flags, B_DONE))
 		panic("biodone already");
 
-	if (ISSET(bp->b_flags, B_ERROR)) {
-		fslog_io_error(bp);
-	}
+	bap = &bp->b_attr;
 
 	if (bp->b_vp && bp->b_vp->v_mount) {
 		mp = bp->b_vp->v_mount;
@@ -3814,8 +3917,9 @@ buf_biodone(buf_t bp)
 		INCR_PENDING_IO(-(pending_io_t)buf_count(bp), mp->mnt_pending_read_size);
 	}
 
-        if (kdebug_enable) {
-	        int    code = DKIO_DONE;
+	if (kdebug_enable) {
+		int code    = DKIO_DONE;
+		int io_tier = GET_BUFATTR_IO_TIER(bap);
 
 		if (bp->b_flags & B_READ)
 		        code |= DKIO_READ;
@@ -3827,24 +3931,20 @@ buf_biodone(buf_t bp)
 		else if (bp->b_flags & B_PAGEIO)
 		        code |= DKIO_PAGING;
 
-		if (bp->b_flags & B_THROTTLED_IO)
+		if (io_tier != 0)
 			code |= DKIO_THROTTLE;
-		else if (bp->b_flags & B_PASSIVE)
+
+		code |= ((io_tier << DKIO_TIER_SHIFT) & DKIO_TIER_MASK);
+
+		if (bp->b_flags & B_PASSIVE)
 			code |= DKIO_PASSIVE;
 
-		if (bp->b_attr.ba_flags & BA_NOCACHE)
+		if (bap->ba_flags & BA_NOCACHE)
 			code |= DKIO_NOCACHE;
 
 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_COMMON, FSDBG_CODE(DBG_DKRW, code) | DBG_FUNC_NONE,
-                              bp, (uintptr_t)bp->b_vp,
-				      bp->b_resid, bp->b_error, 0);
+		                          buf_kernel_addrperm_addr(bp), (uintptr_t)VM_KERNEL_ADDRPERM(bp->b_vp), bp->b_resid, bp->b_error, 0);
         }
-	if ((bp->b_vp != NULLVP) &&
-	    ((bp->b_flags & (B_THROTTLED_IO | B_PASSIVE | B_IOSTREAMING | B_PAGEIO | B_READ | B_THROTTLED_IO | B_PASSIVE)) == (B_PAGEIO | B_READ)) &&
-	    (bp->b_vp->v_mount->mnt_kern_flag & MNTK_ROOTDEV)) {
-	        microuptime(&priority_IO_timestamp_for_root);
-	        hard_throttle_on_root = 0;
-	}
 
 	/*
 	 * I/O was done, so don't believe
@@ -3852,13 +3952,11 @@ buf_biodone(buf_t bp)
 	 * and we need to reset the THROTTLED/PASSIVE
 	 * indicators
 	 */
-	CLR(bp->b_flags, (B_WASDIRTY | B_THROTTLED_IO | B_PASSIVE));
-	CLR(bp->b_attr.ba_flags, (BA_META | BA_NOCACHE));
-#if !CONFIG_EMBEDDED
-	CLR(bp->b_attr.ba_flags, (BA_THROTTLED_IO | BA_DELAYIDLESLEEP));
-#else
-	CLR(bp->b_attr.ba_flags, BA_THROTTLED_IO);
-#endif /* !CONFIG_EMBEDDED */
+	CLR(bp->b_flags, (B_WASDIRTY | B_PASSIVE));
+	CLR(bap->ba_flags, (BA_META | BA_NOCACHE | BA_DELAYIDLESLEEP));
+
+	SET_BUFATTR_IO_TIER(bap, 0);
+
 	DTRACE_IO1(done, buf_t, bp);
 
 	if (!ISSET(bp->b_flags, B_READ) && !ISSET(bp->b_flags, B_RAW))
@@ -3932,6 +4030,18 @@ buf_biodone(buf_t bp)
 biodone_done:
 	KERNEL_DEBUG((FSDBG_CODE(DBG_FSRW, 387)) | DBG_FUNC_END,
                  (uintptr_t)bp, (uintptr_t)bp->b_datap, bp->b_flags, 0, 0);
+}
+
+/*
+ * Obfuscate buf pointers.
+ */
+vm_offset_t
+buf_kernel_addrperm_addr(void * addr)
+{
+	if ((vm_offset_t)addr == 0)
+		return 0;
+	else
+		return ((vm_offset_t)addr + buf_kernel_addrperm);
 }
 
 /*
@@ -4073,6 +4183,9 @@ free_io_buf(buf_t bp)
 	bp->b_vp = NULL;
 	bp->b_flags = B_INVAL;
 
+	/* Zero out the bufattr and its flags before relinquishing this iobuf */
+	bzero (&bp->b_attr, sizeof(struct bufattr));
+	
 	lck_mtx_lock_spin(iobuffer_mtxp);
 
 	binsheadfree(bp, &iobufqueue, -1);
@@ -4279,9 +4392,10 @@ buffer_cache_gc(int all)
 	 * We only care about metadata (incore storage comes from zalloc()).
 	 * Unless "all" is set (used to evict meta data buffers in preparation
 	 * for deep sleep), we only evict up to BUF_MAX_GC_BATCH_SIZE buffers
-	 * that have not been accessed in the last 30s. This limit controls both
-	 * the hold time of the global lock "buf_mtxp" and the length of time
-	 * we spend compute bound in the GC thread which calls this function
+	 * that have not been accessed in the last BUF_STALE_THRESHOLD seconds.
+	 * BUF_MAX_GC_BATCH_SIZE controls both the hold time of the global lock
+	 * "buf_mtxp" and the length of time we spend compute bound in the GC
+	 * thread which calls this function
 	 */
 	lck_mtx_lock(buf_mtxp);
 
@@ -4481,334 +4595,3 @@ bflushq(int whichq, mount_t mp)
 	return (total_writes);
 }
 #endif
-
-
-#if BALANCE_QUEUES
-
-/* XXX move this to a separate file */
-
-/*
- * NOTE: THIS CODE HAS NOT BEEN UPDATED
- * WITH RESPECT TO THE NEW LOCKING MODEL
- */
-   
-
-/*
- * Dynamic Scaling of the Buffer Queues
- */
-
-typedef long long blsize_t;
-
-blsize_t MAXNBUF; /* initialize to (sane_size / PAGE_SIZE) */
-/* Global tunable limits */
-blsize_t nbufh;			/* number of buffer headers */
-blsize_t nbuflow;		/* minimum number of buffer headers required */
-blsize_t nbufhigh;		/* maximum number of buffer headers allowed */
-blsize_t nbuftarget;	/* preferred number of buffer headers */
-
-/*
- * assertions:
- *
- * 1.	0 < nbuflow <= nbufh <= nbufhigh
- * 2.	nbufhigh <= MAXNBUF
- * 3.	0 < nbuflow <= nbuftarget <= nbufhigh
- * 4.	nbufh can not be set by sysctl().
- */
-
-/* Per queue tunable limits */
-
-struct bufqlim {
-	blsize_t	bl_nlow;	/* minimum number of buffer headers required */
-	blsize_t	bl_num;		/* number of buffer headers on the queue */
-	blsize_t	bl_nlhigh;	/* maximum number of buffer headers allowed */
-	blsize_t	bl_target;	/* preferred number of buffer headers */
-	long	bl_stale;	/* Seconds after which a buffer is considered stale */
-} bufqlim[BQUEUES];
-
-/*
- * assertions:
- *
- * 1.	0 <= bl_nlow <= bl_num <= bl_nlhigh
- * 2.	bl_nlhigh <= MAXNBUF
- * 3.  bufqlim[BQ_META].bl_nlow != 0
- * 4.  bufqlim[BQ_META].bl_nlow > (number of possible concurrent 
- *									file system IO operations)
- * 5.	bl_num can not be set by sysctl().
- * 6.	bl_nhigh <= nbufhigh
- */
-
-/*
- * Rationale:
- * ----------
- * Defining it blsize_t as long permits 2^31 buffer headers per queue.
- * Which can describe (2^31 * PAGE_SIZE) memory per queue.
- * 
- * These limits are exported to by means of sysctl().
- * It was decided to define blsize_t as a 64 bit quantity.
- * This will make sure that we will not be required to change it
- * as long as we do not exceed 64 bit address space for the kernel.
- * 
- * low and high numbers parameters initialized at compile time
- * and boot arguments can be used to override them. sysctl() 
- * would not change the value. sysctl() can get all the values 
- * but can set only target. num is the current level.
- *
- * Advantages of having a "bufqscan" thread doing the balancing are, 
- * Keep enough bufs on BQ_EMPTY.
- *	getnewbuf() by default will always select a buffer from the BQ_EMPTY.
- *		getnewbuf() perfoms best if a buffer was found there.
- *		Also this minimizes the possibility of starting IO
- *		from getnewbuf(). That's a performance win, too.
- *
- *	Localize complex logic [balancing as well as time aging]
- *		to balancebufq().
- *
- *	Simplify getnewbuf() logic by elimination of time aging code.
- */
-
-/* 
- * Algorithm:
- * -----------
- * The goal of the dynamic scaling of the buffer queues to to keep
- * the size of the LRU close to bl_target. Buffers on a queue would
- * be time aged.
- *
- * There would be a thread which will be responsible for "balancing"
- * the buffer cache queues.
- *
- * The scan order would be:	AGE, LRU, META, EMPTY.
- */
-
-long bufqscanwait = 0;
-
-static void bufqscan_thread();
-static int balancebufq(int q);
-static int btrimempty(int n);
-static __inline__ int initbufqscan(void);
-static __inline__ int nextbufq(int q);
-static void buqlimprt(int all);
-
-
-static __inline__ void
-bufqinc(int q)
-{
-	if ((q < 0) || (q >= BQUEUES))
-		return;
-
-	bufqlim[q].bl_num++;
-	return;
-}
-
-static __inline__ void
-bufqdec(int q)
-{
-	if ((q < 0) || (q >= BQUEUES))
-		return; 
-
-	bufqlim[q].bl_num--;
-	return;
-}
-
-static void
-bufq_balance_thread_init(void)
-{
-	thread_t	thread = THREAD_NULL;
-
-	if (bufqscanwait++ == 0) {
-
-		/* Initalize globals */
-		MAXNBUF = (sane_size / PAGE_SIZE);
-		nbufh = nbuf_headers;
-		nbuflow = min(nbufh, 100);
-		nbufhigh = min(MAXNBUF, max(nbufh, 2048));
-		nbuftarget = (sane_size >> 5) / PAGE_SIZE;
-		nbuftarget = max(nbuflow, nbuftarget);
-		nbuftarget = min(nbufhigh, nbuftarget);
-
-		/*
-		 * Initialize the bufqlim 
-		 */ 
-
-		/* LOCKED queue */
-		bufqlim[BQ_LOCKED].bl_nlow = 0;
-		bufqlim[BQ_LOCKED].bl_nlhigh = 32;
-		bufqlim[BQ_LOCKED].bl_target = 0;
-		bufqlim[BQ_LOCKED].bl_stale = 30;
-
-		/* LRU queue */
-		bufqlim[BQ_LRU].bl_nlow = 0;
-		bufqlim[BQ_LRU].bl_nlhigh = nbufhigh/4;
-		bufqlim[BQ_LRU].bl_target = nbuftarget/4;
-		bufqlim[BQ_LRU].bl_stale = LRU_IS_STALE;
-
-		/* AGE queue */
-		bufqlim[BQ_AGE].bl_nlow = 0;
-		bufqlim[BQ_AGE].bl_nlhigh = nbufhigh/4;
-		bufqlim[BQ_AGE].bl_target = nbuftarget/4;
-		bufqlim[BQ_AGE].bl_stale = AGE_IS_STALE;
-
-		/* EMPTY queue */
-		bufqlim[BQ_EMPTY].bl_nlow = 0;
-		bufqlim[BQ_EMPTY].bl_nlhigh = nbufhigh/4;
-		bufqlim[BQ_EMPTY].bl_target = nbuftarget/4;
-		bufqlim[BQ_EMPTY].bl_stale = 600000;
-
-		/* META queue */
-		bufqlim[BQ_META].bl_nlow = 0;
-		bufqlim[BQ_META].bl_nlhigh = nbufhigh/4;
-		bufqlim[BQ_META].bl_target = nbuftarget/4;
-		bufqlim[BQ_META].bl_stale = META_IS_STALE;
-
-		/* LAUNDRY queue */
-		bufqlim[BQ_LOCKED].bl_nlow = 0;
-		bufqlim[BQ_LOCKED].bl_nlhigh = 32;
-		bufqlim[BQ_LOCKED].bl_target = 0;
-		bufqlim[BQ_LOCKED].bl_stale = 30;
-
-		buqlimprt(1);
-	}
-
-	/* create worker thread */
-	kernel_thread_start((thread_continue_t)bufqscan_thread, NULL, &thread);
-	thread_deallocate(thread);
-}
-
-/* The workloop for the buffer balancing thread */
-static void
-bufqscan_thread()
-{
-	int moretodo = 0;
-
-	for(;;) {
-		do {
-			int q;	/* buffer queue to process */
-		
-			q = initbufqscan();
-			for (; q; ) {
-				moretodo |= balancebufq(q);
-				q = nextbufq(q);
-			}
-		} while (moretodo);
-
-#if DIAGNOSTIC
-		vfs_bufstats();
-		buqlimprt(0);
-#endif
-		(void)tsleep((void *)&bufqscanwait, PRIBIO, "bufqscanwait", 60 * hz);
-		moretodo = 0;
-	}
-}
-
-/* Seed for the buffer queue balancing */
-static __inline__ int
-initbufqscan()
-{
-	/* Start with AGE queue */
-	return (BQ_AGE);
-}
-
-/* Pick next buffer queue to balance */
-static __inline__ int
-nextbufq(int q)
-{
-	int order[] = { BQ_AGE, BQ_LRU, BQ_META, BQ_EMPTY, 0 };
-	
-	q++;
-	q %= sizeof(order);
-	return (order[q]);
-}
-
-/* function to balance the buffer queues */
-static int
-balancebufq(int q)
-{
-	int moretodo = 0;
-	int n, t;
-	
-	/* reject invalid q */
-	if ((q < 0) || (q >= BQUEUES))
-		goto out;
-
-	/* LOCKED or LAUNDRY queue MUST not be balanced */
-	if ((q == BQ_LOCKED) || (q == BQ_LAUNDRY))
-		goto out;
-
-	n = (bufqlim[q].bl_num - bufqlim[q].bl_target);
-
-	/* If queue has less than target nothing more to do */
-	if (n < 0)
-		goto out;
-
-	if ( n > 8 ) {
-		/* Balance only a small amount (12.5%) at a time */
-		n >>= 3;
-	}
-
-	/* EMPTY queue needs special handling */
-	if (q == BQ_EMPTY) {
-		moretodo |= btrimempty(n);
-		goto out;
-	}
-
-	t = buf_timestamp():
-	
-	for (; n > 0; n--) {
-		struct buf *bp = bufqueues[q].tqh_first;
-		if (!bp)
-			break;
-		
-		/* check if it's stale */
-		if ((t - bp->b_timestamp) > bufqlim[q].bl_stale) {
-			if (bcleanbuf(bp, FALSE)) {
-				/* buf_bawrite() issued, bp not ready */
-				moretodo = 1;
-			} else {
-				/* release the cleaned buffer to BQ_EMPTY */
-				SET(bp->b_flags, B_INVAL);
-				buf_brelse(bp);
-			}
-		} else
-			break;		
-	}
-
-out:
-	return (moretodo);		
-}
-
-static int
-btrimempty(int n)
-{
-	/*
-	 * When struct buf are allocated dynamically, this would
-	 * reclaim upto 'n' struct buf from the empty queue.
-	 */
-	 
-	 return (0);
-}
-
-static void
-buqlimprt(int all)
-{
-	int i;
-    static char *bname[BQUEUES] =
-		{ "LOCKED", "LRU", "AGE", "EMPTY", "META", "LAUNDRY" };
-
-	if (all)
-		for (i = 0; i < BQUEUES; i++) {
-			printf("%s : ", bname[i]);
-			printf("min = %ld, ", (long)bufqlim[i].bl_nlow);
-			printf("cur = %ld, ", (long)bufqlim[i].bl_num);
-			printf("max = %ld, ", (long)bufqlim[i].bl_nlhigh);
-			printf("target = %ld, ", (long)bufqlim[i].bl_target);
-			printf("stale after %ld seconds\n", bufqlim[i].bl_stale);
-		}
-	else
-		for (i = 0; i < BQUEUES; i++) {
-			printf("%s : ", bname[i]);
-			printf("cur = %ld, ", (long)bufqlim[i].bl_num);
-		}
-}
-
-#endif
-
-

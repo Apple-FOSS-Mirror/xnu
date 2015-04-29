@@ -99,11 +99,21 @@
 #include <sys/ubc.h>
 #include <kern/kalloc.h>
 #include <kern/task.h>
+#include <kern/coalition.h>
+#include <sys/coalition.h>
 #include <kern/assert.h>
 #include <vm/vm_protos.h>
 #include <vm/vm_map.h>		/* vm_map_switch_protect() */
+#include <vm/vm_pageout.h>
 #include <mach/task.h>
 #include <mach/message.h>
+#include <sys/priv.h>
+#include <sys/proc_info.h>
+#include <sys/bsdtask_info.h>
+
+#if CONFIG_MEMORYSTATUS
+#include <sys/kern_memorystatus.h>
+#endif
 
 #if CONFIG_MACF
 #include <security/mac_framework.h>
@@ -158,16 +168,18 @@ lck_attr_t * lctx_lck_attr;
 static	void	lctxinit(void);
 #endif
 
-int cs_debug;	/* declared further down in this file */
+extern int cs_debug;
 
 #if DEBUG
 #define __PROC_INTERNAL_DEBUG 1
 #endif
 /* Name to give to core files */
-__private_extern__ char corefilename[MAXPATHLEN+1] = {"/cores/core.%P"};
+__XNU_PRIVATE_EXTERN char corefilename[MAXPATHLEN+1] = {"/cores/core.%P"};
 
 static void orphanpg(struct pgrp *pg);
 void 	proc_name_kdp(task_t t, char * buf, int size);
+int	proc_threadname_kdp(void *uth, char *buf, size_t size);
+void	proc_starttime_kdp(void *p, uint64_t *tv_sec, uint64_t *tv_usec);
 char	*proc_name_address(void *p);
 
 static void  pgrp_add(struct pgrp * pgrp, proc_t parent, proc_t child);
@@ -176,6 +188,7 @@ static void pgrp_replace(proc_t p, struct pgrp *pgrp);
 static void pgdelete_dropref(struct pgrp *pgrp);
 extern void pg_rele_dropref(struct pgrp * pgrp);
 static int csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user_addr_t uaddittoken);
+static boolean_t proc_parent_is_currentproc(proc_t p);
 
 struct fixjob_iterargs {
 	struct pgrp * pg;
@@ -432,29 +445,32 @@ proc_rele_locked(proc_t p)
 proc_t
 proc_find_zombref(int pid)
 {
-	proc_t p1 = PROC_NULL;
-	proc_t p = PROC_NULL;
+	proc_t p;
 
 	proc_list_lock();
 
+ again:
 	p = pfind_locked(pid);
 
-	/* if process still in creation return NULL */
-	if ((p == PROC_NULL) || ((p->p_listflag & P_LIST_INCREATE) != 0)) {
+	/* should we bail? */
+	if ((p == PROC_NULL)					/* not found */
+	    || ((p->p_listflag & P_LIST_INCREATE) != 0)		/* not created yet */
+	    || ((p->p_listflag & P_LIST_EXITED) == 0)) {	/* not started exit */
+
 		proc_list_unlock();
-		return (p1);
+		return (PROC_NULL);
 	}
 
-	/* if process has not started exit or  is being reaped, return NULL */
-	if (((p->p_listflag & P_LIST_EXITED) != 0) && ((p->p_listflag & P_LIST_WAITING) == 0)) {
-		p->p_listflag |=  P_LIST_WAITING;
-		p1 = p;
-	} else 
-		p1 = PROC_NULL;
+	/* If someone else is controlling the (unreaped) zombie - wait */
+	if ((p->p_listflag & P_LIST_WAITING) != 0) {
+		(void)msleep(&p->p_stat, proc_list_mlock, PWAIT, "waitcoll", 0);
+		goto again;
+	}
+	p->p_listflag |=  P_LIST_WAITING;
 
 	proc_list_unlock();
 
-	return(p1);
+	return(p);
 }
 
 void
@@ -593,28 +609,64 @@ proc_checkdeadrefs(__unused proc_t p)
 int
 proc_pid(proc_t p)
 {
-	return(p->p_pid);
+	return (p->p_pid);
 }
 
 int 
 proc_ppid(proc_t p)
 {
-		return(p->p_ppid);
+	return (p->p_ppid);
 }
 
-int 
+int
 proc_selfpid(void)
 {
-	proc_t p = current_proc();
-	return(p->p_pid);
+	return (current_proc()->p_pid);
+}
+
+int
+proc_selfppid(void)
+{
+	return (current_proc()->p_ppid);
+}
+
+#if CONFIG_DTRACE
+static proc_t
+dtrace_current_proc_vforking(void)
+{
+	thread_t th = current_thread();
+	struct uthread *ut = get_bsdthread_info(th);
+
+	if (ut &&
+	    ((ut->uu_flag & (UT_VFORK|UT_VFORKING)) == (UT_VFORK|UT_VFORKING))) {
+		/*
+		 * Handle the narrow window where we're in the vfork syscall,
+		 * but we're not quite ready to claim (in particular, to DTrace)
+		 * that we're running as the child.
+		 */
+		return (get_bsdtask_info(get_threadtask(th)));
+	}
+	return (current_proc());
+}
+
+int
+dtrace_proc_selfpid(void)
+{
+	return (dtrace_current_proc_vforking()->p_pid);
 }
 
 int 
-proc_selfppid(void)
+dtrace_proc_selfppid(void)
 {
-	proc_t p = current_proc();
-	return(p->p_ppid);
+	return (dtrace_current_proc_vforking()->p_ppid);
 }
+
+uid_t
+dtrace_proc_selfruid(void)
+{
+	return (dtrace_current_proc_vforking()->p_ruid);
+}
+#endif /* CONFIG_DTRACE */
 
 proc_t 
 proc_parent(proc_t p)
@@ -635,6 +687,18 @@ loop:
 	return(parent);
 }
 
+static boolean_t
+proc_parent_is_currentproc(proc_t p)
+{
+	boolean_t ret = FALSE;
+	
+	proc_list_lock();
+	if (p->p_pptr == current_proc())
+		ret = TRUE;
+
+	proc_list_unlock();
+	return ret;
+}
 
 void
 proc_name(int pid, char * buf, int size)
@@ -654,6 +718,44 @@ proc_name_kdp(task_t t, char * buf, int size)
 
 	if (p != PROC_NULL)
 		strlcpy(buf, &p->p_comm[0], size);
+}
+
+
+int
+proc_threadname_kdp(void *uth, char *buf, size_t size)
+{
+	if (size < MAXTHREADNAMESIZE) {
+		/* this is really just a protective measure for the future in
+		 * case the thread name size in stackshot gets out of sync with
+		 * the BSD max thread name size. Note that bsd_getthreadname
+		 * doesn't take input buffer size into account. */
+		return -1;
+	}
+
+	if (uth != NULL) {
+		bsd_getthreadname(uth, buf);
+	}
+	return 0;
+}
+
+/* note that this function is generally going to be called from stackshot,
+ * and the arguments will be coming from a struct which is declared packed
+ * thus the input arguments will in general be unaligned. We have to handle
+ * that here. */
+void
+proc_starttime_kdp(void *p, uint64_t *tv_sec, uint64_t *tv_usec)
+{
+	proc_t pp = (proc_t)p;
+	struct uint64p {
+		uint64_t val;
+	} __attribute__((packed));
+
+	if (pp != PROC_NULL) {
+		if (tv_sec != NULL)
+			((struct uint64p *)tv_sec)->val = pp->p_start.tv_sec;
+		if (tv_usec != NULL)
+			((struct uint64p *)tv_usec)->val = pp->p_start.tv_usec;
+	}
 }
 
 char *
@@ -730,17 +832,6 @@ proc_forcequota(proc_t p)
 }
 
 int
-proc_tbe(proc_t p)
-{
-	int retval = 0;
-
-	if (p)
-		retval = p->p_flag & P_TBE;
-	return(retval? 1: 0);
-
-}
-
-int
 proc_suser(proc_t p)
 {
 	kauth_cred_t my_cred;
@@ -811,10 +902,31 @@ proc_uniqueid(proc_t p)
 }
 
 uint64_t
-proc_selfuniqueid(void)
+proc_puniqueid(proc_t p)
 {
-	proc_t p = current_proc();
-	return(p->p_uniqueid);
+	return(p->p_puniqueid);
+}
+
+uint64_t
+proc_coalitionid(__unused proc_t p)
+{
+#if CONFIG_COALITIONS
+	return(task_coalition_id(p->task));
+#else
+	return 0;
+#endif
+}
+
+uint64_t
+proc_was_throttled(proc_t p)
+{
+	return (p->was_throttled);
+}
+
+uint64_t
+proc_did_throttle(proc_t p)
+{
+	return (p->did_throttle);
 }
 
 int
@@ -829,6 +941,21 @@ proc_getexecutableuuid(proc_t p, unsigned char *uuidbuf, unsigned long size)
 	if (size >= sizeof(p->p_uuid)) {
 		memcpy(uuidbuf, p->p_uuid, sizeof(p->p_uuid));
 	}
+}
+
+/* Return vnode for executable with an iocount. Must be released with vnode_put() */
+vnode_t
+proc_getexecutablevnode(proc_t p)
+{
+	vnode_t tvp  = p->p_textvp;
+
+	if ( tvp != NULLVP) {
+		if (vnode_getwithref(tvp) == 0) {
+			return tvp;
+		}
+	}       
+
+	return NULLVP;
 }
 
 
@@ -991,12 +1118,18 @@ pinsertchild(proc_t parent, proc_t child)
 	TAILQ_INIT(&child->p_evlist);
 	child->p_pptr = parent;
 	child->p_ppid = parent->p_pid;
+	child->p_puniqueid = parent->p_uniqueid;
 
 	pg = proc_pgrp(parent);
 	pgrp_add(pg, parent, child);
 	pg_rele(pg);
 
 	proc_list_lock();
+	
+#if CONFIG_MEMORYSTATUS
+	memorystatus_add(child, TRUE);
+#endif
+	
 	parent->p_childrencnt++;
 	LIST_INSERT_HEAD(&parent->p_children, child, p_sibling);
 
@@ -1005,7 +1138,6 @@ pinsertchild(proc_t parent, proc_t child)
 	child->p_listflag &= ~P_LIST_INCREATE;
 
 	proc_list_unlock();
-
 }
 
 /*
@@ -1294,12 +1426,24 @@ fixjobc(proc_t p, struct pgrp *pgrp, int entering)
 	struct session *mysession = pgrp->pg_session;
 	proc_t parent;
 	struct fixjob_iterargs fjarg;
+	boolean_t proc_parent_self;
 
-	parent = proc_parent(p);
+	/*
+	 * Check if p's parent is current proc, if yes then no need to take 
+	 * a ref; calling proc_parent with current proc as parent may 
+	 * deadlock if current proc is exiting.
+	 */
+	proc_parent_self = proc_parent_is_currentproc(p);
+	if (proc_parent_self)
+		parent = current_proc();
+	else 
+		parent = proc_parent(p);
+
 	if (parent != PROC_NULL) {
 		hispgrp = proc_pgrp(parent);	
 		hissess = proc_session(parent);
-		proc_rele(parent);
+		if (!proc_parent_self)
+			proc_rele(parent);
 	}
 
 
@@ -1422,6 +1566,12 @@ proc_t
 current_proc_EXTERNAL(void)
 {
 	return (current_proc());
+}
+
+int
+proc_is_forcing_hfs_case_sensitivity(proc_t p)
+{
+	return (p->p_vfs_iopolicy & P_VFS_IOPOLICY_FORCE_HFS_CASE_SENSITIVITY) ? 1 : 0;
 }
 
 /*
@@ -1720,16 +1870,34 @@ csops_audittoken(__unused proc_t p, struct csops_audittoken_args *uap, __unused 
 {
 	if (uap->uaudittoken == USER_ADDR_NULL)
 		return(EINVAL);
-	switch (uap->ops) {
-		case CS_OPS_PIDPATH:
-		case CS_OPS_ENTITLEMENTS_BLOB:
-			break;
-		default:
-			return(EINVAL);
-	};
-
 	return(csops_internal(uap->pid, uap->ops, uap->useraddr, 
 		uap->usersize, uap->uaudittoken));
+}
+
+static int
+csops_copy_token(void *start, size_t length, user_size_t usize, user_addr_t uaddr)
+{
+	char fakeheader[8] = { 0 };
+	int error;
+
+	if (usize < sizeof(fakeheader))
+		return ERANGE;
+
+	/* if no blob, fill in zero header */
+	if (NULL == start) {
+		start = fakeheader;
+		length = sizeof(fakeheader);
+	} else if (usize < length) {
+		/* ... if input too short, copy out length of entitlement */
+		uint32_t length32 = htonl((uint32_t)length);
+		memcpy(&fakeheader[4], &length32, sizeof(length32));
+		
+		error = copyout(fakeheader, uaddr, sizeof(fakeheader));
+		if (error == 0)
+			return ERANGE; /* input buffer to short, ERANGE signals that */
+		return error;
+	}
+	return copyout(start, uaddr, length);
 }
 
 static int
@@ -1737,12 +1905,10 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 {
 	size_t usize = (size_t)CAST_DOWN(size_t, usersize);
 	proc_t pt;
-	uint32_t retflags;
-	int vid, forself;
+	int forself;
 	int error;
 	vnode_t tvp;
 	off_t toff;
-	char * buf;
 	unsigned char cdhash[SHA1_RESULTLEN];
 	audit_token_t token;
 	unsigned int upid=0, uidversion = 0;
@@ -1755,25 +1921,18 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 		forself = 1;
 
 
-	/* Pre flight checks for CS_OPS_PIDPATH */
-	if (ops == CS_OPS_PIDPATH) {
-		/* usize is unsigned.. */
-	 	if (usize > 4 * PATH_MAX)
-			return(EOVERFLOW);
-		if (kauth_cred_issuser(kauth_cred_get()) != TRUE) 
-			return(EPERM);
-	} else {
-		switch (ops) {
+	switch (ops) {
 		case CS_OPS_STATUS:
 		case CS_OPS_CDHASH:
 		case CS_OPS_PIDOFFSET:
 		case CS_OPS_ENTITLEMENTS_BLOB:
+		case CS_OPS_IDENTITY:
+		case CS_OPS_BLOB:
 			break;	/* unrestricted */
 		default:
 			if (forself == 0 && kauth_cred_issuser(kauth_cred_get()) != TRUE)
 				return(EPERM);
 			break;
-		}
 	}
 
 	pt = proc_find(pid);
@@ -1796,12 +1955,19 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 
 	switch (ops) {
 
-		case CS_OPS_STATUS:
+		case CS_OPS_STATUS: {
+			uint32_t retflags;
+
+			proc_lock(pt);
 			retflags = pt->p_csflags;
+			if (cs_enforcement(pt))
+				retflags |= CS_ENFORCEMENT;
+			proc_unlock(pt);
+
 			if (uaddr != USER_ADDR_NULL)
 				error = copyout(&retflags, uaddr, sizeof(uint32_t));
 			break;
-		
+		}
 		case CS_OPS_MARKINVALID:
 			proc_lock(pt);
 			if ((pt->p_csflags & CS_VALID) == CS_VALID) {	/* is currently valid */
@@ -1844,38 +2010,6 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 				proc_unlock(pt);
 			break;
 
-		case CS_OPS_PIDPATH:
-			tvp = pt->p_textvp;
-			vid = vnode_vid(tvp);
-
-			if (tvp == NULLVP) {
-				proc_rele(pt);
-				return(EINVAL);
-			}
-
-			buf = (char *)kalloc(usize);
-			if (buf == NULL)  {
-				proc_rele(pt);
-				return(ENOMEM);
-			}
-			bzero(buf, usize);
-
-			error = vnode_getwithvid(tvp, vid);
-			if (error == 0) {
-				int len; 
-				len = usize;
-				error = vn_getpath(tvp, buf, &len);
-				vnode_put(tvp);
-				if (error == 0) {
-					error = copyout(buf, uaddr, usize);
-				}
-				kfree(buf, usize);
-			}
-
-			proc_rele(pt);
-
-			return(error);
-
 		case CS_OPS_PIDOFFSET:
 			toff = pt->p_textoff;
 			proc_rele(pt);
@@ -1903,43 +2037,132 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 			return error;
 
 		case CS_OPS_ENTITLEMENTS_BLOB: {
-			char fakeheader[8] = { 0 };
 			void *start;
 			size_t length;
 
+			proc_lock(pt);
+
 			if ((pt->p_csflags & CS_VALID) == 0) {
+				proc_unlock(pt);
 				error = EINVAL;
 				break;
 			}
-			if (usize < sizeof(fakeheader)) {
-				error = ERANGE;
-				break;
-			}
-			if (0 != (error = cs_entitlements_blob_get(pt,
-			    &start, &length)))
-				break;
-			/* if no entitlement, fill in zero header */
-			if (NULL == start) {
-				start = fakeheader;
-				length = sizeof(fakeheader);
-			} else if (usize < length) {
-				/* ... if input too short, copy out length of entitlement */
-				uint32_t length32 = htonl((uint32_t)length);
-				memcpy(&fakeheader[4], &length32, sizeof(length32));
 
-				error = copyout(fakeheader, uaddr, sizeof(fakeheader));
-				if (error == 0)
-					error = ERANGE; /* input buffer to short, ERANGE signals that */
+			error = cs_entitlements_blob_get(pt, &start, &length);
+			proc_unlock(pt);
+			if (error)
 				break;
-			}
-			error = copyout(start, uaddr, length);
+
+			error = csops_copy_token(start, length, usize, uaddr);
 			break;
 		}
-
 		case CS_OPS_MARKRESTRICT:
 			proc_lock(pt);
 			pt->p_csflags |= CS_RESTRICT;
 			proc_unlock(pt);
+			break;
+
+		case CS_OPS_SET_STATUS: {
+			uint32_t flags;
+
+			if (usize < sizeof(flags)) {
+				error = ERANGE;
+				break;
+			}
+
+			error = copyin(uaddr, &flags, sizeof(flags));
+			if (error)
+				break;
+
+			/* only allow setting a subset of all code sign flags */
+			flags &=
+			    CS_HARD | CS_EXEC_SET_HARD |
+			    CS_KILL | CS_EXEC_SET_KILL |
+			    CS_RESTRICT |
+			    CS_REQUIRE_LV |
+			    CS_ENFORCEMENT | CS_EXEC_SET_ENFORCEMENT;
+
+			proc_lock(pt);
+			if (pt->p_csflags & CS_VALID)
+				pt->p_csflags |= flags;
+			else
+				error = EINVAL;
+			proc_unlock(pt);
+
+			break;
+		}
+		case CS_OPS_BLOB: {
+			void *start;
+			size_t length;
+
+			proc_lock(pt);
+			if ((pt->p_csflags & CS_VALID) == 0) {
+				proc_unlock(pt);
+				error = EINVAL;
+				break;
+			}
+
+			error = cs_blob_get(pt, &start, &length);
+			proc_unlock(pt);
+			if (error)
+				break;
+
+			error = csops_copy_token(start, length, usize, uaddr);
+			break;
+		}
+		case CS_OPS_IDENTITY: {
+			const char *identity;
+			uint8_t fakeheader[8];
+			uint32_t idlen;
+			size_t length;
+
+			/*
+			 * Make identity have a blob header to make it
+			 * easier on userland to guess the identity
+			 * length.
+			 */
+			if (usize < sizeof(fakeheader)) {
+			    error = ERANGE;
+			    break;
+			}
+			memset(fakeheader, 0, sizeof(fakeheader));
+
+			proc_lock(pt);
+			if ((pt->p_csflags & CS_VALID) == 0) {
+				proc_unlock(pt);
+				error = EINVAL;
+				break;
+			}
+
+			identity = cs_identity_get(pt);
+			proc_unlock(pt);
+			if (identity == NULL) {
+				error = ENOENT;
+				break;
+			}
+			
+			length = strlen(identity) + 1; /* include NUL */
+			idlen = htonl(length + sizeof(fakeheader));
+			memcpy(&fakeheader[4], &idlen, sizeof(idlen));
+
+			error = copyout(fakeheader, uaddr, sizeof(fakeheader));
+			if (error)
+				break;
+
+			if (usize < sizeof(fakeheader) + length)
+				error = ERANGE;
+			else if (usize > sizeof(fakeheader))
+				error = copyout(identity, uaddr + sizeof(fakeheader), length);
+
+			break;
+		}
+
+		case CS_OPS_SIGPUP_INSTALL:
+			error = sigpup_install(uaddr);
+			break;
+
+		case CS_OPS_SIGPUP_DROP:
+			error = sigpup_drop();
 			break;
 
 		default:
@@ -2011,13 +2234,11 @@ proc_iterate(flags, callout, arg, filterfn, filterarg)
 
 			switch (retval) {
 		  		case PROC_RETURNED:
+		  			proc_rele(p);
+		  			break;
 		  		case PROC_RETURNED_DONE:
 			  		proc_rele(p);
-			  		if (retval == PROC_RETURNED_DONE) {
-						goto out;
-			  		}
-			  		break;
-
+			  		goto out;
 		  		case PROC_CLAIMED_DONE:
 					goto out;
 		  		case PROC_CLAIMED:
@@ -2031,13 +2252,11 @@ proc_iterate(flags, callout, arg, filterfn, filterarg)
 		
 				switch (retval) {
 		  			case PROC_RETURNED:
+		  				proc_drop_zombref(p);
+		  				break;
 		  			case PROC_RETURNED_DONE:
 						proc_drop_zombref(p);
-			  			if (retval == PROC_RETURNED_DONE) {
-							goto out;
-			  			}
-			  			break;
-
+						goto out;
 		  			case PROC_CLAIMED_DONE:
 						goto out;
 		  			case PROC_CLAIMED:
@@ -2589,12 +2808,12 @@ session_rele(struct session *sess)
 }
 
 int
-proc_transstart(proc_t p, int locked)
+proc_transstart(proc_t p, int locked, int non_blocking)
 {
 	if (locked == 0)
 		proc_lock(p);
 	while ((p->p_lflag & P_LINTRANSIT) == P_LINTRANSIT) {
-		if ((p->p_lflag & P_LTRANSCOMMIT) == P_LTRANSCOMMIT) {
+		if (((p->p_lflag & P_LTRANSCOMMIT) == P_LTRANSCOMMIT) || non_blocking) {
 			if (locked == 0)
 				proc_unlock(p);
 			return EDEADLK;
@@ -2699,107 +2918,6 @@ proc_knote_drain(struct proc *p)
 	proc_klist_unlock();
 }
 
-unsigned long cs_procs_killed = 0;
-unsigned long cs_procs_invalidated = 0;
-int cs_force_kill = 0;
-int cs_force_hard = 0;
-int cs_debug = 0;
-SYSCTL_INT(_vm, OID_AUTO, cs_force_kill, CTLFLAG_RW | CTLFLAG_LOCKED, &cs_force_kill, 0, "");
-SYSCTL_INT(_vm, OID_AUTO, cs_force_hard, CTLFLAG_RW | CTLFLAG_LOCKED, &cs_force_hard, 0, "");
-SYSCTL_INT(_vm, OID_AUTO, cs_debug, CTLFLAG_RW | CTLFLAG_LOCKED, &cs_debug, 0, "");
-
-int
-cs_allow_invalid(struct proc *p)
-{
-#if MACH_ASSERT
-	lck_mtx_assert(&p->p_mlock, LCK_MTX_ASSERT_NOTOWNED);
-#endif
-#if CONFIG_MACF && CONFIG_ENFORCE_SIGNED_CODE
-	/* There needs to be a MAC policy to implement this hook, or else the
-	 * kill bits will be cleared here every time. If we have 
-	 * CONFIG_ENFORCE_SIGNED_CODE, we can assume there is a policy
-	 * implementing the hook. 
-	 */
-	if( 0 != mac_proc_check_run_cs_invalid(p)) {
-		if(cs_debug) printf("CODE SIGNING: cs_allow_invalid() "
-				    "not allowed: pid %d\n", 
-				    p->p_pid);
-		return 0;
-	}
-	if(cs_debug) printf("CODE SIGNING: cs_allow_invalid() "
-			    "allowed: pid %d\n", 
-			    p->p_pid);
-	proc_lock(p);
-	p->p_csflags &= ~(CS_KILL | CS_HARD | CS_VALID);
-	proc_unlock(p);
-	vm_map_switch_protect(get_task_map(p->task), FALSE);
-#endif
-	return (p->p_csflags & (CS_KILL | CS_HARD)) == 0;
-}
-
-int
-cs_invalid_page(
-	addr64_t vaddr)
-{
-	struct proc	*p;
-	int		retval;
-
-	p = current_proc();
-
-	/*
-	 * XXX revisit locking when proc is no longer protected
-	 * by the kernel funnel...
-	 */
-
-	/* XXX for testing */
-	proc_lock(p);
-	if (cs_force_kill)
-		p->p_csflags |= CS_KILL;
-	if (cs_force_hard)
-		p->p_csflags |= CS_HARD;
-
-	/* CS_KILL triggers us to send a kill signal. Nothing else. */
-	if (p->p_csflags & CS_KILL) {
-		p->p_csflags |= CS_KILLED;
-		proc_unlock(p);
-		if (cs_debug) {
-			printf("CODE SIGNING: cs_invalid_page(0x%llx): "
-			       "p=%d[%s] honoring CS_KILL, final status 0x%x\n",
-			       vaddr, p->p_pid, p->p_comm, p->p_csflags);
-		}
-		cs_procs_killed++;
-		psignal(p, SIGKILL);
-		proc_lock(p);
-	}
-	
-	/* CS_HARD means fail the mapping operation so the process stays valid. */
-	if (p->p_csflags & CS_HARD) {
-		proc_unlock(p);
-		if (cs_debug) {
-			printf("CODE SIGNING: cs_invalid_page(0x%llx): "
-			       "p=%d[%s] honoring CS_HARD\n",
-			       vaddr, p->p_pid, p->p_comm);
-		}
-		retval = 1;
-	} else {
-		if (p->p_csflags & CS_VALID) {
-			p->p_csflags &= ~CS_VALID;
-			
-			proc_unlock(p);
-			cs_procs_invalidated++;
-			printf("CODE SIGNING: cs_invalid_page(0x%llx): "
-			       "p=%d[%s] clearing CS_VALID\n",
-			       vaddr, p->p_pid, p->p_comm);
-		} else {
-			proc_unlock(p);
-		}
-		
-		retval = 0;
-	}
-
-	return retval;
-}
-
 void 
 proc_setregister(proc_t p)
 {
@@ -2846,7 +2964,7 @@ proc_getpcontrol(int pid, int * pcontrolp)
 }
 
 int
-proc_dopcontrol(proc_t p, void *num_found)
+proc_dopcontrol(proc_t p)
 {
 	int pcontrol;
 
@@ -2854,13 +2972,12 @@ proc_dopcontrol(proc_t p, void *num_found)
 
 	pcontrol = PROC_CONTROL_STATE(p);
 
-	if (PROC_ACTION_STATE(p) ==0) {
+	if (PROC_ACTION_STATE(p) == 0) {
 		switch(pcontrol) {
 			case P_PCTHROTTLE:
 				PROC_SETACTION_STATE(p);
 				proc_unlock(p);
 				printf("low swap: throttling pid %d (%s)\n", p->p_pid, p->p_comm);
-				(*(int *)num_found)++;
 				break;
 
 			case P_PCSUSP:
@@ -2868,7 +2985,6 @@ proc_dopcontrol(proc_t p, void *num_found)
 				proc_unlock(p);
 				printf("low swap: suspending pid %d (%s)\n", p->p_pid, p->p_comm);
 				task_suspend(p->task);
-				(*(int *)num_found)++;
 				break;
 
 			case P_PCKILL:
@@ -2876,7 +2992,6 @@ proc_dopcontrol(proc_t p, void *num_found)
 				proc_unlock(p);
 				printf("low swap: killing pid %d (%s)\n", p->p_pid, p->p_comm);
 				psignal(p, SIGKILL);
-				(*(int *)num_found)++;
 				break;
 
 			default:
@@ -2950,97 +3065,246 @@ proc_resetpcontrol(int pid)
 }
 
 
-/*
- * Return true if the specified process has an action state specified for it and it isn't
- * already in an action state and it's using more physical memory than the specified threshold.
- * Note: the memory_threshold argument is specified in bytes and is of type uint64_t.
- */
+
+struct no_paging_space
+{
+	uint64_t	pcs_max_size;
+	uint64_t	pcs_uniqueid;
+	int		pcs_pid;
+	int		pcs_proc_count;
+	uint64_t	pcs_total_size;
+
+	uint64_t	npcs_max_size;
+	uint64_t	npcs_uniqueid;
+	int		npcs_pid;
+	int		npcs_proc_count;
+	uint64_t	npcs_total_size;
+
+	int		apcs_proc_count;
+	uint64_t	apcs_total_size;
+};
+
 
 static int
-proc_pcontrol_filter(proc_t p, void *memory_thresholdp)
+proc_pcontrol_filter(proc_t p, void *arg)
 {
-	
-	return PROC_CONTROL_STATE(p) && 						/* if there's an action state specified... */
-	      (PROC_ACTION_STATE(p) == 0) && 						/* and we're not in the action state yet... */
-	      (get_task_resident_size(p->task) > *((uint64_t *)memory_thresholdp)); 	/* and this proc is over the mem threshold, */
-											/* then return true to take action on this proc */
+	struct no_paging_space *nps;
+	uint64_t	compressed;
+
+	nps = (struct no_paging_space *)arg;
+
+	compressed = get_task_compressed(p->task);
+
+	if (PROC_CONTROL_STATE(p)) {
+		if (PROC_ACTION_STATE(p) == 0) {
+			if (compressed > nps->pcs_max_size) {
+				nps->pcs_pid = p->p_pid;
+				nps->pcs_uniqueid = p->p_uniqueid;
+				nps->pcs_max_size = compressed;
+			}
+			nps->pcs_total_size += compressed;
+			nps->pcs_proc_count++;
+		} else {
+			nps->apcs_total_size += compressed;
+			nps->apcs_proc_count++;
+		}
+	} else {
+		if (compressed > nps->npcs_max_size) {
+			nps->npcs_pid = p->p_pid;
+			nps->npcs_uniqueid = p->p_uniqueid;
+			nps->npcs_max_size = compressed;
+		}
+		nps->npcs_total_size += compressed;
+		nps->npcs_proc_count++;
+
+	}
+	return (0);
 }
 
 
+static int
+proc_pcontrol_null(__unused proc_t p, __unused void *arg)
+{
+	return(PROC_RETURNED);
+}
+
 
 /*
- * Deal with the out of swap space condition.  This routine gets called when
- * we want to swap something out but there's no more space left.  Since this
- * creates a memory deadlock situtation, we need to take action to free up
- * some memory resources in order to prevent the system from hanging completely.
- * The action we take is based on what the system processes running at user level
- * have specified.  Processes are marked in one of four categories: ones that
- * can be killed immediately, ones that should be suspended, ones that should
- * be throttled, and all the rest which are basically none of the above.  Which
- * processes are marked as being in which category is a user level policy decision;
- * we just take action based on those decisions here.
+ * Deal with the low on compressor pool space condition... this function
+ * gets called when we are approaching the limits of the compressor pool or
+ * we are unable to create a new swap file.
+ * Since this eventually creates a memory deadlock situtation, we need to take action to free up
+ * memory resources (both compressed and uncompressed) in order to prevent the system from hanging completely.
+ * There are 2 categories of processes to deal with.  Those that have an action
+ * associated with them by the task itself and those that do not.  Actionable 
+ * tasks can have one of three categories specified:  ones that
+ * can be killed immediately, ones that should be suspended, and ones that should
+ * be throttled.  Processes that do not have an action associated with them are normally
+ * ignored unless they are utilizing such a large percentage of the compressor pool (currently 50%)
+ * that only by killing them can we hope to put the system back into a usable state.
  */
 
-#define STARTING_PERCENTAGE	50	/* memory threshold expressed as a percentage */
-					/* of physical memory			      */
+#define	NO_PAGING_SPACE_DEBUG	0
+
+extern uint64_t	vm_compressor_pages_compressed(void);
 
 struct timeval	last_no_space_action = {0, 0};
 
-void
-no_paging_space_action(void)
+int
+no_paging_space_action()
 {
-
-	uint64_t	memory_threshold;
-	int		num_found;
+	proc_t		p;
+	struct no_paging_space nps;
 	struct timeval	now;
 
 	/*
-	 * Throttle how often we come through here.  Once every 20 seconds should be plenty.
+	 * Throttle how often we come through here.  Once every 5 seconds should be plenty.
 	 */
-
 	microtime(&now);
 
-	if (now.tv_sec <= last_no_space_action.tv_sec + 20)
-		return;
-
-	last_no_space_action = now;
+	if (now.tv_sec <= last_no_space_action.tv_sec + 5)
+		return (0);
 
 	/*
-	 * Examine all processes and find those that have been marked to have some action
-	 * taken when swap space runs out.  Of those processes, select one or more and 
-	 * apply the specified action to them.  The idea is to only take action against
-	 * a few processes rather than hitting too many at once.  If the low swap condition
-	 * persists, this routine will get called again and we'll take action against more
-	 * processes.
+	 * Examine all processes and find the biggest (biggest is based on the number of pages this 
+	 * task has in the compressor pool) that has been marked to have some action
+	 * taken when swap space runs out... we also find the biggest that hasn't been marked for
+	 * action.
 	 *
-	 * Of the processes that have been marked, we choose which ones to take action 
-	 * against according to how much physical memory they're presently using.  We
-	 * start with the STARTING_THRESHOLD and any processes using more physical memory
-	 * than the percentage threshold will have action taken against it.  If there
-	 * are no processes over the threshold, then the threshold is cut in half and we
-	 * look again for processes using more than this threshold.  We continue in
-	 * this fashion until we find at least one process to take action against.  This
-	 * iterative approach is less than ideally efficient, however we only get here
-	 * when the system is almost in a memory deadlock and is pretty much just
-	 * thrashing if it's doing anything at all.  Therefore, the cpu overhead of
-	 * potentially multiple passes here probably isn't revelant.
+	 * If the biggest non-actionable task is over the "dangerously big" threashold (currently 50% of
+	 * the total number of pages held by the compressor, we go ahead and kill it since no other task
+	 * can have any real effect on the situation.  Otherwise, we go after the actionable process.
 	 */
+	bzero(&nps, sizeof(nps));
 
-	memory_threshold = (sane_size * STARTING_PERCENTAGE) / 100;	/* resident threshold in bytes */
+	proc_iterate(PROC_ALLPROCLIST, proc_pcontrol_null, (void *)NULL, proc_pcontrol_filter, (void *)&nps);
 
-	for (num_found = 0; num_found == 0; memory_threshold = memory_threshold / 2) {
-		proc_iterate(PROC_ALLPROCLIST, proc_dopcontrol, (void *)&num_found, proc_pcontrol_filter, (void *)&memory_threshold);
-
+#if NO_PAGING_SPACE_DEBUG
+	printf("low swap: npcs_proc_count = %d, npcs_total_size = %qd, npcs_max_size = %qd\n",
+	       nps.npcs_proc_count, nps.npcs_total_size, nps.npcs_max_size);
+	printf("low swap: pcs_proc_count = %d, pcs_total_size = %qd, pcs_max_size = %qd\n",
+	       nps.pcs_proc_count, nps.pcs_total_size, nps.pcs_max_size);
+	printf("low swap: apcs_proc_count = %d, apcs_total_size = %qd\n",
+	       nps.apcs_proc_count, nps.apcs_total_size);
+#endif
+	if (nps.npcs_max_size > (vm_compressor_pages_compressed() * 50) / 100) {
 		/*
-		 * If we just looked with memory_threshold == 0, then there's no need to iterate any further since
-		 * we won't find any eligible processes at this point.
+		 * for now we'll knock out any task that has more then 50% of the pages
+		 * held by the compressor
 		 */
+		if ((p = proc_find(nps.npcs_pid)) != PROC_NULL) {
+	
+			if (nps.npcs_uniqueid == p->p_uniqueid) {
+				/*
+				 * verify this is still the same process
+				 * in case the proc exited and the pid got reused while
+				 * we were finishing the proc_iterate and getting to this point
+				 */
+				last_no_space_action = now;
 
-		if (memory_threshold == 0) {
-			if (num_found == 0)	/* log that we couldn't do anything in this case */
-				printf("low swap: unable to find any eligible processes to take action on\n");
+				printf("low swap: killing pid %d (%s)\n", p->p_pid, p->p_comm);
+				psignal(p, SIGKILL);
+			
+				proc_rele(p);
 
-			break;
+				return (0);
+			}
+				
+			proc_rele(p);
 		}
 	}
+
+	if (nps.pcs_max_size > 0) {
+		if ((p = proc_find(nps.pcs_pid)) != PROC_NULL) {
+
+			if (nps.pcs_uniqueid == p->p_uniqueid) {
+				/*
+				 * verify this is still the same process
+				 * in case the proc exited and the pid got reused while
+				 * we were finishing the proc_iterate and getting to this point
+				 */
+				last_no_space_action = now;
+		
+				proc_dopcontrol(p);
+			
+				proc_rele(p);
+				
+				return (1);
+			}
+	
+			proc_rele(p);
+		}
+	}
+	last_no_space_action = now;
+
+	printf("low swap: unable to find any eligible processes to take action on\n");
+
+	return (0);
 }
+
+int 
+proc_trace_log(__unused proc_t p,  struct proc_trace_log_args *uap, __unused int *retval)
+{
+	int ret = 0;
+	proc_t target_proc = PROC_NULL;
+	pid_t target_pid = uap->pid;
+	uint64_t target_uniqueid = uap->uniqueid;
+	task_t target_task = NULL;
+
+	if (priv_check_cred(kauth_cred_get(), PRIV_PROC_TRACE_INSPECT, 0)) {
+		ret = EPERM;
+		goto out;
+	}
+	target_proc = proc_find(target_pid);
+	if (target_proc != PROC_NULL) {
+		if (target_uniqueid != proc_uniqueid(target_proc)) {
+			ret = ENOENT;
+			goto out;
+		}
+
+		target_task = proc_task(target_proc);
+		if (task_send_trace_memory(target_task, target_pid, target_uniqueid)) {
+			ret = EINVAL;
+			goto out;
+		}
+	} else
+		ret = ENOENT;
+
+out:
+	if (target_proc != PROC_NULL)
+		proc_rele(target_proc);
+	return (ret);
+}
+
+#if VM_SCAN_FOR_SHADOW_CHAIN
+extern int vm_map_shadow_max(vm_map_t map);
+int proc_shadow_max(void);
+int proc_shadow_max(void)
+{
+	int		retval, max;
+	proc_t		p;
+	task_t		task;
+	vm_map_t	map;
+
+	max = 0;
+	proc_list_lock();
+	for (p = allproc.lh_first; (p != 0); p = p->p_list.le_next) {
+		if (p->p_stat == SIDL)
+			continue;
+		task = p->task;
+		if (task == NULL) {
+			continue;
+		}
+		map = get_task_map(task);
+		if (map == NULL) {
+			continue;
+		}
+		retval = vm_map_shadow_max(map);
+		if (retval > max) {
+			max = retval;
+		}
+	}
+	proc_list_unlock();
+	return max;
+}
+#endif /* VM_SCAN_FOR_SHADOW_CHAIN */

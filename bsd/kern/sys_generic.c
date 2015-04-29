@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2010 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -81,6 +81,7 @@
 #include <sys/socketvar.h>
 #include <sys/uio_internal.h>
 #include <sys/kernel.h>
+#include <sys/guarded.h>
 #include <sys/stat.h>
 #include <sys/malloc.h>
 #include <sys/sysproto.h>
@@ -94,6 +95,7 @@
 #include <sys/event.h>
 #include <sys/eventvar.h>
 #include <sys/proc.h>
+#include <sys/kauth.h>
 
 #include <mach/mach_types.h>
 #include <kern/kern_types.h>
@@ -103,8 +105,10 @@
 #include <kern/clock.h>
 #include <kern/ledger.h>
 #include <kern/task.h>
+#include <kern/telemetry.h>
 
 #include <sys/mbuf.h>
+#include <sys/domain.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/errno.h>
@@ -142,9 +146,7 @@ void postevent(struct socket *, struct sockbuf *, int);
 extern kern_return_t IOBSDGetPlatformUUID(__darwin_uuid_t uuid, mach_timespec_t timeoutp);
 
 int rd_uio(struct proc *p, int fdes, uio_t uio, user_ssize_t *retval);
-int wr_uio(struct proc *p, int fdes, uio_t uio, user_ssize_t *retval);
-extern void	*get_bsduthreadarg(thread_t);
-extern int	*get_bsduthreadrval(thread_t);
+int wr_uio(struct proc *p, struct fileproc *fp, uio_t uio, user_ssize_t *retval);
 
 __private_extern__ int	dofileread(vfs_context_t ctx, struct fileproc *fp,
 								   user_addr_t bufp, user_size_t nbyte, 
@@ -169,13 +171,8 @@ select_wait_queue_init(void)
 	wait_queue_init(&select_conflict_queue, SYNC_POLICY_FIFO);
 }
 
-
-#if NETAT
-extern int appletalk_inited;
-#endif /* NETAT */
-
 #define f_flag f_fglob->fg_flag
-#define f_type f_fglob->fg_type
+#define f_type f_fglob->fg_ops->fo_type
 #define f_msgcount f_fglob->fg_msgcount
 #define f_cred f_fglob->fg_cred
 #define f_ops f_fglob->fg_ops
@@ -272,9 +269,6 @@ void
 donefileread(struct proc *p, struct fileproc *fp, int fd)
 {
 	proc_fdlock_spin(p);
-
-	fp->f_flags &= ~FP_INCHRREAD;
-
 	fp_drop(p, fd, fp, 1);
         proc_fdunlock(p);
 }
@@ -323,8 +317,6 @@ preparefileread(struct proc *p, struct fileproc **fp_ret, int fd, int check_for_
 			error = ENXIO;
 			goto out;
 		}
-		if (vp->v_type == VCHR)
-			fp->f_flags |= FP_INCHRREAD;
 	}
 
 	*fp_ret = fp;
@@ -429,7 +421,10 @@ readv_nocancel(struct proc *p, struct readv_nocancel_args *uap, user_ssize_t *re
 	
 	/* finalize uio_t for use and do the IO 
 	 */
-	uio_calculateresid(auio);
+	error = uio_calculateresid(auio);
+	if (error) {
+		goto ExitThisRoutine;
+	}
 	error = rd_uio(p, uap->fd, auio, retval);
 
 ExitThisRoutine:
@@ -461,6 +456,7 @@ write_nocancel(struct proc *p, struct write_nocancel_args *uap, user_ssize_t *re
 	struct fileproc *fp;
 	int error;      
 	int fd = uap->fd;
+	bool wrote_some = false;
 
 	AUDIT_ARG(fd, fd);
 
@@ -469,14 +465,20 @@ write_nocancel(struct proc *p, struct write_nocancel_args *uap, user_ssize_t *re
 		return(error);
 	if ((fp->f_flag & FWRITE) == 0) {
 		error = EBADF;
+	} else if (FP_ISGUARDED(fp, GUARD_WRITE)) {
+		proc_fdlock(p);
+		error = fp_guard_exception(p, fd, fp, kGUARD_EXC_WRITE);
+		proc_fdunlock(p);
 	} else {
 		struct vfs_context context = *(vfs_context_current());
 		context.vc_ucred = fp->f_fglob->fg_cred;
 
 		error = dofilewrite(&context, fp, uap->cbuf, uap->nbyte,
 			(off_t)-1, 0, retval);
+
+		wrote_some = *retval > 0;
 	}
-	if (error == 0)
+	if (wrote_some)
 	        fp_drop_written(p, fd, fp);
 	else
 	        fp_drop(p, fd, fp, 0);
@@ -508,6 +510,7 @@ pwrite_nocancel(struct proc *p, struct pwrite_nocancel_args *uap, user_ssize_t *
         int error; 
 	int fd = uap->fd;
 	vnode_t vp  = (vnode_t)0;
+	bool wrote_some = false;
 
 	AUDIT_ARG(fd, fd);
 
@@ -517,6 +520,10 @@ pwrite_nocancel(struct proc *p, struct pwrite_nocancel_args *uap, user_ssize_t *
 
 	if ((fp->f_flag & FWRITE) == 0) {
 		error = EBADF;
+	} else if (FP_ISGUARDED(fp, GUARD_WRITE)) {
+		proc_fdlock(p);
+		error = fp_guard_exception(p, fd, fp, kGUARD_EXC_WRITE);
+		proc_fdunlock(p);
 	} else {
 		struct vfs_context context = *vfs_context_current();
 		context.vc_ucred = fp->f_fglob->fg_cred;
@@ -541,9 +548,10 @@ pwrite_nocancel(struct proc *p, struct pwrite_nocancel_args *uap, user_ssize_t *
 
 		    error = dofilewrite(&context, fp, uap->buf, uap->nbyte,
 			uap->offset, FOF_OFFSET, retval);
+			wrote_some = *retval > 0;
         }
 errout:
-	if (error == 0)
+	if (wrote_some)
 	        fp_drop_written(p, fd, fp);
 	else
 	        fp_drop(p, fd, fp, 0);
@@ -570,8 +578,10 @@ dofilewrite(vfs_context_t ctx, struct fileproc *fp,
 	user_ssize_t bytecnt;
 	char uio_buf[ UIO_SIZEOF(1) ];
 
-	if (nbyte > INT_MAX)   
+	if (nbyte > INT_MAX) {
+		*retval = 0;
 		return (EINVAL);
+	}
 
 	if (IS_64BIT_PROCESS(vfs_context_proc(ctx))) {
 		auio = uio_createwithbuffer(1, offset, UIO_USERSPACE64, UIO_WRITE, 
@@ -615,7 +625,9 @@ writev_nocancel(struct proc *p, struct writev_nocancel_args *uap, user_ssize_t *
 {
 	uio_t auio = NULL;
 	int error;
+	struct fileproc *fp;
 	struct user_iovec *iovp;
+	bool wrote_some = false;
 
 	AUDIT_ARG(fd, uap->fd);
 
@@ -645,8 +657,30 @@ writev_nocancel(struct proc *p, struct writev_nocancel_args *uap, user_ssize_t *
 	
 	/* finalize uio_t for use and do the IO 
 	 */
-	uio_calculateresid(auio);
-	error = wr_uio(p, uap->fd, auio, retval);
+	error = uio_calculateresid(auio);
+	if (error) {
+		goto ExitThisRoutine;
+	}
+
+	error = fp_lookup(p, uap->fd, &fp, 0);
+	if (error)
+		goto ExitThisRoutine;
+	
+	if ((fp->f_flag & FWRITE) == 0) {
+		error = EBADF;
+	} else if (FP_ISGUARDED(fp, GUARD_WRITE)) {
+		proc_fdlock(p);
+		error = fp_guard_exception(p, uap->fd, fp, kGUARD_EXC_WRITE);
+		proc_fdunlock(p);
+	} else {
+		error = wr_uio(p, fp, auio, retval);
+		wrote_some = *retval > 0;
+	}
+	
+	if (wrote_some)
+	        fp_drop_written(p, uap->fd, fp);
+	else
+	        fp_drop(p, uap->fd, fp, 0);
 
 ExitThisRoutine:
 	if (auio != NULL) {
@@ -657,21 +691,12 @@ ExitThisRoutine:
 
 
 int
-wr_uio(struct proc *p, int fdes, uio_t uio, user_ssize_t *retval)
+wr_uio(struct proc *p, struct fileproc *fp, uio_t uio, user_ssize_t *retval)
 {
-	struct fileproc *fp;
 	int error;
 	user_ssize_t count;
 	struct vfs_context context = *vfs_context_current();
 
-	error = fp_lookup(p,fdes,&fp,0);
-	if (error)
-		return(error);
-
-	if ((fp->f_flag & FWRITE) == 0) {
-		error = EBADF;
-		goto out;
-	}
 	count = uio_resid(uio);
 
 	context.vc_ucred = fp->f_cred;
@@ -687,11 +712,6 @@ wr_uio(struct proc *p, int fdes, uio_t uio, user_ssize_t *retval)
 	}
 	*retval = count - uio_resid(uio);
 
-out:
-	if (error == 0)
-	        fp_drop_written(p, fdes, fp);
-	else
-	        fp_drop(p, fdes, fp, 0);
 	return(error);
 }
 
@@ -741,16 +761,16 @@ rd_uio(struct proc *p, int fdes, uio_t uio, user_ssize_t *retval)
 int
 ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 {
-	struct fileproc *fp;
-	u_long com;
+	struct fileproc *fp = NULL;
 	int error = 0;
-	u_int size;
-	caddr_t datap, memp;
-	boolean_t is64bit;
-	int tmp;
+	u_int size = 0;
+	caddr_t datap = NULL, memp = NULL;
+	boolean_t is64bit = FALSE;
+	int tmp = 0;
 #define STK_PARAMS	128
 	char stkbuf[STK_PARAMS];
 	int fd = uap->fd;
+	u_long com = uap->com;
 	struct vfs_context context = *vfs_context_current();
 
 	AUDIT_ARG(fd, uap->fd);
@@ -759,16 +779,59 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 	is64bit = proc_is64bit(p);
 #if CONFIG_AUDIT
 	if (is64bit)
-		AUDIT_ARG(value64, uap->com);
+		AUDIT_ARG(value64, com);
 	else
-		AUDIT_ARG(cmd, CAST_DOWN_EXPLICIT(int, uap->com));
+		AUDIT_ARG(cmd, CAST_DOWN_EXPLICIT(int, com));
 #endif /* CONFIG_AUDIT */
+
+	/*
+	 * Interpret high order word to find amount of data to be
+	 * copied to/from the user's address space.
+	 */
+	size = IOCPARM_LEN(com);
+	if (size > IOCPARM_MAX)
+			return ENOTTY;
+	if (size > sizeof (stkbuf)) {
+		if ((memp = (caddr_t)kalloc(size)) == 0)
+			return ENOMEM;
+		datap = memp;
+	} else
+		datap = &stkbuf[0];
+	if (com & IOC_IN) {
+		if (size) {
+			error = copyin(uap->data, datap, size);
+			if (error)
+				goto out_nofp;
+		} else {
+			/* XXX - IOC_IN and no size?  we should proably return an error here!! */
+			if (is64bit) {
+				*(user_addr_t *)datap = uap->data;
+			}
+			else {
+				*(uint32_t *)datap = (uint32_t)uap->data;
+			}
+		}
+	} else if ((com & IOC_OUT) && size)
+		/*
+		 * Zero the buffer so the user always
+		 * gets back something deterministic.
+		 */
+		bzero(datap, size);
+	else if (com & IOC_VOID) {
+		/* XXX - this is odd since IOC_VOID means no parameters */
+		if (is64bit) {
+			*(user_addr_t *)datap = uap->data;
+		}
+		else {
+			*(uint32_t *)datap = (uint32_t)uap->data;
+		}
+	}
 
 	proc_fdlock(p);
 	error = fp_lookup(p,fd,&fp,1);
 	if (error)  {
 		proc_fdunlock(p);
-		return(error);
+		goto out_nofp;
 	}
 
 	AUDIT_ARG(file, p, fp);
@@ -781,103 +844,19 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 	context.vc_ucred = fp->f_fglob->fg_cred;
 
 #if CONFIG_MACF
-	error = mac_file_check_ioctl(context.vc_ucred, fp->f_fglob, uap->com);
+	error = mac_file_check_ioctl(context.vc_ucred, fp->f_fglob, com);
 	if (error)
 		goto out;
 #endif
-		
-#if NETAT
-	/*
-	 * ### LD 6/11/97 Hack Alert: this is to get AppleTalk to work
-	 * while implementing an ATioctl system call
-	 */
-	{
-		if (appletalk_inited && ((uap->com & 0x0000FFFF) == 0xff99)) {
-			u_long  fixed_command;
-
-#ifdef APPLETALK_DEBUG
-			kprintf("ioctl: special AppleTalk \n");
-#endif
-			datap = &stkbuf[0];
-			*(user_addr_t *)datap = uap->data;
-			fixed_command = _IOW(0, 0xff99, uap->data);
-			error = fo_ioctl(fp, fixed_command, datap, &context);
-			goto out;
-		}
-	}
-
-#endif /* NETAT */
-
-
-	switch (com = uap->com) {
-	case FIONCLEX:
-		*fdflags(p, uap->fd) &= ~UF_EXCLOSE;
-		error =0;
-		goto out;
-	case FIOCLEX:
-		*fdflags(p, uap->fd) |= UF_EXCLOSE;
-		error =0;
-		goto out;
-	}
-
-	/*
-	 * Interpret high order word to find amount of data to be
-	 * copied to/from the user's address space.
-	 */
-	size = IOCPARM_LEN(com);
-	if (size > IOCPARM_MAX) {
-			error = ENOTTY;
-			goto out;
-	}
-	memp = NULL;
-	if (size > sizeof (stkbuf)) {
-		proc_fdunlock(p);
-		if ((memp = (caddr_t)kalloc(size)) == 0) {
-			proc_fdlock(p);
-			error = ENOMEM;
-			goto out;
-		}
-		proc_fdlock(p);
-		datap = memp;
-	} else
-		datap = &stkbuf[0];
-	if (com&IOC_IN) {
-		if (size) {
-			proc_fdunlock(p);
-			error = copyin(uap->data, datap, size);
-			if (error) {
-				if (memp)
-					kfree(memp, size);
-				proc_fdlock(p);
-				goto out;
-			}
-			proc_fdlock(p);
-		} else {
-			/* XXX - IOC_IN and no size?  we should proably return an error here!! */
-			if (is64bit) {
-				*(user_addr_t *)datap = uap->data;
-			}
-			else {
-				*(uint32_t *)datap = (uint32_t)uap->data;
-			}
-		}
-	} else if ((com&IOC_OUT) && size)
-		/*
-		 * Zero the buffer so the user always
-		 * gets back something deterministic.
-		 */
-		bzero(datap, size);
-	else if (com&IOC_VOID) {
-		/* XXX - this is odd since IOC_VOID means no parameters */
-		if (is64bit) {
-			*(user_addr_t *)datap = uap->data;
-		}
-		else {
-			*(uint32_t *)datap = (uint32_t)uap->data;
-		}
-	}
 
 	switch (com) {
+	case FIONCLEX:
+		*fdflags(p, fd) &= ~UF_EXCLOSE;
+		break;
+
+	case FIOCLEX:
+		*fdflags(p, fd) |= UF_EXCLOSE;
+		break;
 
 	case FIONBIO:
 		if ( (tmp = *(int *)datap) )
@@ -899,7 +878,6 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 		tmp = *(int *)datap;
 		if (fp->f_type == DTYPE_SOCKET) {
 			((struct socket *)fp->f_data)->so_pgid = tmp;
-			error = 0;
 			break;
 		}
 		if (fp->f_type == DTYPE_PIPE) {
@@ -922,7 +900,6 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 
 	case FIOGETOWN:
 		if (fp->f_type == DTYPE_SOCKET) {
-			error = 0;
 			*(int *)datap = ((struct socket *)fp->f_data)->so_pgid;
 			break;
 		}
@@ -936,17 +913,17 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 		 * Copy any data to user, size was
 		 * already set and checked above.
 		 */
-		if (error == 0 && (com&IOC_OUT) && size)
+		if (error == 0 && (com & IOC_OUT) && size)
 			error = copyout(datap, uap->data, (u_int)size);
 		break;
 	}
-	proc_fdunlock(p);
-	if (memp)
-		kfree(memp, size);
-	proc_fdlock(p);
 out:
 	fp_drop(p, fd, fp, 1);
 	proc_fdunlock(p);
+
+out_nofp:
+	if (memp)
+		kfree(memp, size);
 	return(error);
 }
 
@@ -955,7 +932,7 @@ int	selwait, nselcoll;
 #define SEL_SECONDPASS 2
 extern int selcontinue(int error);
 extern int selprocess(int error, int sel_pass);
-static int selscan(struct proc *p, struct _select * sel,
+static int selscan(struct proc *p, struct _select * sel, struct _select_data * seldata,
 			int nfd, int32_t *retval, int sel_pass, wait_queue_sub_t wqsub);
 static int selcount(struct proc *p, u_int32_t *ibits, int nfd, int *count);
 static int seldrop_locked(struct proc *p, u_int32_t *ibits, int nfd, int lim, int *need_wakeup, int fromselcount);
@@ -984,14 +961,18 @@ select_nocancel(struct proc *p, struct select_nocancel_args *uap, int32_t *retva
 	thread_t th_act;
 	struct uthread	*uth;
 	struct _select *sel;
+	struct _select_data *seldata;
 	int needzerofill = 1;
 	int count = 0;
 
 	th_act = current_thread();
 	uth = get_bsdthread_info(th_act);
 	sel = &uth->uu_select;
-	retval = (int *)get_bsduthreadrval(th_act);
+	seldata = &uth->uu_kevent.ss_select_data;
 	*retval = 0;
+
+	seldata->args = uap;
+	seldata->retval = retval;
 
 	if (uap->nd < 0) {
 		return (EINVAL);
@@ -1084,16 +1065,16 @@ select_nocancel(struct proc *p, struct select_nocancel_args *uap, int32_t *retva
 		}
 
 		clock_absolutetime_interval_to_deadline(
-										tvtoabstime(&atv), &sel->abstime);
+										tvtoabstime(&atv), &seldata->abstime);
 	}
 	else
-		sel->abstime = 0;
+		seldata->abstime = 0;
 
 	if ( (error = selcount(p, sel->ibits, uap->nd, &count)) ) {
 			goto continuation;
 	}
 
-	sel->count = count;
+	seldata->count = count;
 	size = SIZEOF_WAITQUEUE_SET + (count * SIZEOF_WAITQUEUE_LINK);
 	if (uth->uu_allocsize) {
 		if (uth->uu_wqset == 0)
@@ -1113,7 +1094,7 @@ select_nocancel(struct proc *p, struct select_nocancel_args *uap, int32_t *retva
 			panic("failed to allocate memory for waitqueue\n");
 	}
 	bzero(uth->uu_wqset, size);
-	sel->wql = (char *)uth->uu_wqset + SIZEOF_WAITQUEUE_SET;
+	seldata->wql = (char *)uth->uu_wqset + SIZEOF_WAITQUEUE_SET;
 	wait_queue_set_init(uth->uu_wqset, (SYNC_POLICY_FIFO | SYNC_POLICY_PREPOST));
 
 continuation:
@@ -1152,9 +1133,10 @@ selprocess(int error, int sel_pass)
 	thread_t th_act;
 	struct uthread	*uth;
 	struct proc *p;
-	struct select_args *uap;
+	struct select_nocancel_args *uap;
 	int *retval;
 	struct _select *sel;
+	struct _select_data *seldata;
 	int unwind = 1;
 	int prepost = 0;
 	int somewakeup = 0;
@@ -1163,14 +1145,15 @@ selprocess(int error, int sel_pass)
 
 	p = current_proc();
 	th_act = current_thread();
-	uap = (struct select_args *)get_bsduthreadarg(th_act);
-	retval = (int *)get_bsduthreadrval(th_act);
 	uth = get_bsdthread_info(th_act);
 	sel = &uth->uu_select;
+	seldata = &uth->uu_kevent.ss_select_data;
+	uap = seldata->args;
+	retval = seldata->retval;
 
 	if ((error != 0) && (sel_pass == SEL_FIRSTPASS))
 			unwind = 0;
-	if (sel->count == 0)
+	if (seldata->count == 0)
 			unwind = 0;
 retry:
 	if (error != 0) {
@@ -1181,7 +1164,7 @@ retry:
 	ncoll = nselcoll;
 	OSBitOrAtomic(P_SELECT, &p->p_flag);
 	/* skip scans if the select is just for timeouts */
-	if (sel->count) {
+	if (seldata->count) {
 		/*
 		 * Clear out any dangling refs from prior calls; technically
 		 * there should not be any.
@@ -1189,7 +1172,7 @@ retry:
 		if (sel_pass == SEL_FIRSTPASS)
 			wait_queue_sub_clearrefs(uth->uu_wqset);
 
-		error = selscan(p, sel, uap->nd, retval, sel_pass, (wait_queue_sub_t)uth->uu_wqset);
+		error = selscan(p, sel, seldata, uap->nd, retval, sel_pass, (wait_queue_sub_t)uth->uu_wqset);
 		if (error || *retval) {
 			goto done;
 		}
@@ -1210,7 +1193,7 @@ retry:
 		uint64_t	now;
 
 		clock_get_uptime(&now);
-		if (now >= sel->abstime)
+		if (now >= seldata->abstime)
 			goto done;
 	}
 
@@ -1225,7 +1208,7 @@ retry:
 	 * To effect a poll, the timeout argument should be
 	 * non-nil, pointing to a zero-valued timeval structure.
 	 */
-	if (uap->tv && sel->abstime == 0) {
+	if (uap->tv && seldata->abstime == 0) {
 		goto done;
 	}
 
@@ -1238,12 +1221,13 @@ retry:
 	OSBitAndAtomic(~((uint32_t)P_SELECT), &p->p_flag);
 
 	/* if the select is just for timeout skip check */
-	if (sel->count &&(sel_pass == SEL_SECONDPASS))
+	if (seldata->count &&(sel_pass == SEL_SECONDPASS))
 		panic("selprocess: 2nd pass assertwaiting");
 
 	/* Wait Queue Subordinate has waitqueue as first element */
-	wait_result = wait_queue_assert_wait((wait_queue_t)uth->uu_wqset,
-					     NULL, THREAD_ABORTSAFE, sel->abstime);
+	wait_result = wait_queue_assert_wait_with_leeway((wait_queue_t)uth->uu_wqset,
+					     NULL, THREAD_ABORTSAFE,
+					     TIMEOUT_URGENCY_USER_NORMAL, seldata->abstime, 0);
 	if (wait_result != THREAD_AWAKENED) {
 		/* there are no preposted events */
 		error = tsleep1(NULL, PSOCK | PCATCH,
@@ -1309,7 +1293,7 @@ done:
  *						invalid.
  */
 static int
-selscan(struct proc *p, struct _select *sel, int nfd, int32_t *retval,
+selscan(struct proc *p, struct _select *sel, struct _select_data * seldata, int nfd, int32_t *retval,
 	int sel_pass, wait_queue_sub_t wqsub)
 {
 	struct filedesc *fdp = p->p_fd;
@@ -1337,11 +1321,11 @@ selscan(struct proc *p, struct _select *sel, int nfd, int32_t *retval,
 	}
 	ibits = sel->ibits;
 	obits = sel->obits;
-	wql = sel->wql;
+	wql = seldata->wql;
 
 	nw = howmany(nfd, NFDBITS);
 
-	count = sel->count;
+	count = seldata->count;
 
 	nc = 0;
 	if (count) {
@@ -1355,7 +1339,11 @@ selscan(struct proc *p, struct _select *sel, int nfd, int32_t *retval,
 
 				while ((j = ffs(bits)) && (fd = i + --j) < nfd) {
 					bits &= ~(1 << j);
-					fp = fdp->fd_ofiles[fd];
+
+					if (fd < fdp->fd_nfiles)
+						fp = fdp->fd_ofiles[fd];
+					else
+						fp = NULL;
 
 					if (fp == NULL || (fdp->fd_ofileflags[fd] & UF_RESERVED)) {
 						/*
@@ -1386,7 +1374,7 @@ selscan(struct proc *p, struct _select *sel, int nfd, int32_t *retval,
 					context.vc_ucred = fp->f_cred;
 
 					/* The select; set the bit, if true */
-					if (fp->f_ops
+					if (fp->f_ops && fp->f_type
 						&& fo_select(fp, flag[msk], wql_ptr, &context)) {
 						optr[fd/NFDBITS] |= (1 << (fd % NFDBITS));
 						n++;
@@ -1584,9 +1572,7 @@ poll_callback(__unused struct kqueue *kq, struct kevent64_s *kevp, void *data)
 		if (fds->revents & POLLHUP)
 			mask = (POLLIN | POLLRDNORM | POLLPRI | POLLRDBAND );
 		else {
-			mask = 0;
-			if (kevp->data != 0)
-				mask |= (POLLIN | POLLRDNORM );
+			mask = (POLLIN | POLLRDNORM );
 			if (kevp->flags & EV_OOBAND)
 				mask |= ( POLLPRI | POLLRDBAND );
 		}
@@ -1678,7 +1664,12 @@ selcount(struct proc *p, u_int32_t *ibits, int nfd, int *countp)
 			bits = iptr[i/NFDBITS];
 			while ((j = ffs(bits)) && (fd = i + --j) < nfd) {
 				bits &= ~(1 << j);
-				fp = fdp->fd_ofiles[fd];
+
+				if (fd < fdp->fd_nfiles)
+					fp = fdp->fd_ofiles[fd];
+				else
+					fp = NULL;
+
 				if (fp == NULL ||
 					(fdp->fd_ofileflags[fd] & UF_RESERVED)) {
 						*countp = 0;
@@ -2161,13 +2152,19 @@ postevent(struct socket *sp, struct sockbuf *sb, int event)
 		   */
 		case EV_RWBYTES:
 		  if ((evq->ee_eventmask & EV_RE) && soreadable(sp)) {
-		          if (sp->so_error) {
-			          if ((sp->so_type == SOCK_STREAM) && ((sp->so_error == ECONNREFUSED) || (sp->so_error == ECONNRESET))) {
-				          if ((sp->so_pcb == 0) || (((struct inpcb *)sp->so_pcb)->inp_state == INPCB_STATE_DEAD) || !(tp = sototcpcb(sp)) ||
-					      (tp->t_state == TCPS_CLOSED)) {
-					          mask |= EV_RE|EV_RESET;
-						  break;
-					  }
+			  /* for AFP/OT purposes; may go away in future */
+		          if ((SOCK_DOM(sp) == PF_INET ||
+			      SOCK_DOM(sp) == PF_INET6) &&
+			      SOCK_PROTO(sp) == IPPROTO_TCP &&
+			      (sp->so_error == ECONNREFUSED ||
+			      sp->so_error == ECONNRESET)) {
+			          if (sp->so_pcb == NULL ||
+				      sotoinpcb(sp)->inp_state ==
+				      INPCB_STATE_DEAD ||
+				      (tp = sototcpcb(sp)) == NULL ||
+				      tp->t_state == TCPS_CLOSED) {
+				          mask |= EV_RE|EV_RESET;
+					  break;
 				  }
 			  }
 			  mask |= EV_RE;
@@ -2179,13 +2176,19 @@ postevent(struct socket *sp, struct sockbuf *sb, int event)
 			  }
 		  }
 		  if ((evq->ee_eventmask & EV_WR) && sowriteable(sp)) {
-		          if (sp->so_error) {
-			          if ((sp->so_type == SOCK_STREAM) && ((sp->so_error == ECONNREFUSED) || (sp->so_error == ECONNRESET))) {
-				          if ((sp->so_pcb == 0) || (((struct inpcb *)sp->so_pcb)->inp_state == INPCB_STATE_DEAD) || !(tp = sototcpcb(sp)) ||
-					      (tp->t_state == TCPS_CLOSED)) {
-					          mask |= EV_WR|EV_RESET;
-						  break;
-					  }
+			  /* for AFP/OT purposes; may go away in future */
+		          if ((SOCK_DOM(sp) == PF_INET ||
+			      SOCK_DOM(sp) == PF_INET6) &&
+			      SOCK_PROTO(sp) == IPPROTO_TCP &&
+			      (sp->so_error == ECONNREFUSED ||
+			      sp->so_error == ECONNRESET)) {
+			          if (sp->so_pcb == NULL ||
+				      sotoinpcb(sp)->inp_state ==
+				      INPCB_STATE_DEAD ||
+				      (tp = sototcpcb(sp)) == NULL ||
+				      tp->t_state == TCPS_CLOSED) {
+					  mask |= EV_WR|EV_RESET;
+					  break;
 				  }
 			  }
 			  mask |= EV_WR;
@@ -2774,10 +2777,12 @@ waitevent_close(struct proc *p, struct fileproc *fp)
  *
  * Parameters:	uuid_buf		Pointer to buffer to receive UUID
  *		timeout			Timespec for timout
+ *		spi				SPI, skip sandbox check (temporary)
  *
  * Returns:	0			Success
  *		EWOULDBLOCK		Timeout is too short
  *		copyout:EFAULT		Bad user buffer
+ *		mac_system_check_info:EPERM		Client not allowed to perform this operation
  *
  * Notes:	A timeout seems redundant, since if it's tolerable to not
  *		have a system UUID in hand, then why ask for one?
@@ -2789,6 +2794,9 @@ gethostuuid(struct proc *p, struct gethostuuid_args *uap, __unused int32_t *retv
 	int error;
 	mach_timespec_t mach_ts;	/* for IOKit call */
 	__darwin_uuid_t uuid_kern;	/* for IOKit call */
+
+	if (!uap->spi) {
+	}
 
 	/* Convert the 32/64 bit timespec into a mach_timespec_t */
 	if ( proc_is64bit(p) ) {
@@ -2832,6 +2840,9 @@ gethostuuid(struct proc *p, struct gethostuuid_args *uap, __unused int32_t *retv
 int
 ledger(struct proc *p, struct ledger_args *args, __unused int32_t *retval)
 {
+#if !CONFIG_MACF
+#pragma unused(p)
+#endif
 	int rval, pid, len, error;
 #ifdef LEDGER_DEBUG
 	struct ledger_limit_args lla;
@@ -2876,7 +2887,7 @@ ledger(struct proc *p, struct ledger_args *args, __unused int32_t *retval)
 	switch (args->cmd) {
 #ifdef LEDGER_DEBUG
 		case LEDGER_LIMIT: {
-			if (!is_suser())
+			if (!kauth_cred_issuser(kauth_cred_get()))
 				rval = EPERM;
 			rval = ledger_limit(task, &lla);
 			proc_rele(proc);
@@ -2898,7 +2909,7 @@ ledger(struct proc *p, struct ledger_args *args, __unused int32_t *retval)
 			void *buf;
 			int sz;
 
-			rval = ledger_entry_info(task, &buf, &len);
+			rval = ledger_get_task_entry_info_multiple(task, &buf, &len);
 			proc_rele(proc);
 			if ((rval == 0) && (len > 0)) {
 				sz = len * sizeof (struct ledger_entry_info);
@@ -2930,4 +2941,28 @@ ledger(struct proc *p, struct ledger_args *args, __unused int32_t *retval)
 	}
 
 	return (rval);
+}
+
+int
+telemetry(__unused struct proc *p, struct telemetry_args *args, __unused int32_t *retval)
+{
+	int error = 0;
+
+	switch (args->cmd) {
+#if CONFIG_TELEMETRY
+	case TELEMETRY_CMD_TIMER_EVENT:
+		error = telemetry_timer_event(args->deadline, args->interval, args->leeway);
+		break;
+#endif /* CONFIG_TELEMETRY */
+	case TELEMETRY_CMD_VOUCHER_NAME:
+		if (thread_set_voucher_name((mach_port_name_t)args->deadline))
+			error = EINVAL;
+		break;
+
+	default:
+		error = EINVAL;
+		break;
+	}
+
+	return (error);
 }

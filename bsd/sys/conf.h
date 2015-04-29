@@ -93,12 +93,6 @@ struct vnode;
 #define	D_TTY	3
 
 #ifdef KERNEL
-/*
- * Flags for d_type (squeezed into the top half of d_type).
- */
-#define	D_TYPEMASK	0xffff
-#define	D_TRACKCLOSE	0x00010000	/* track all closes */
-
 /* 
  * Device switch function types.
  */
@@ -263,7 +257,7 @@ struct linesw {
 
 
 extern struct linesw linesw[];
-extern int nlinesw;
+extern const int nlinesw;
  
 int ldisc_register(int , struct linesw *);
 void ldisc_deregister(int);

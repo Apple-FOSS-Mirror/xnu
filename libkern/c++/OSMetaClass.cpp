@@ -494,7 +494,6 @@ OSMetaClass::~OSMetaClass()
 /*********************************************************************
 * Empty overrides.
 *********************************************************************/
-void * OSMetaClass::operator new(__unused size_t size) { return 0; }
 void OSMetaClass::retain() const { }
 void OSMetaClass::release() const { }
 void OSMetaClass::release(__unused int when) const { }
@@ -813,8 +812,10 @@ OSMetaClass::removeInstance(const OSObject * instance, bool super) const
 	    if (superClassLink) {
 		superClassLink->removeInstance(reserved->instances, true);
 	    }
+	    IOLockLock(sAllClassesLock);
 	    reserved->instances->release();
 	    reserved->instances = 0;
+	    IOLockUnlock(sAllClassesLock);
 	}
     }
 

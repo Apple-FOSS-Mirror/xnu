@@ -168,6 +168,15 @@ extern kern_return_t _kernelrpc_mach_vm_protect_trap(
 				vm_prot_t new_protection
 );
 
+extern kern_return_t _kernelrpc_mach_vm_map_trap(
+				mach_port_name_t target,
+				mach_vm_offset_t *address,
+				mach_vm_size_t size,
+				mach_vm_offset_t mask,
+				int flags,
+				vm_prot_t cur_protection
+);
+
 extern kern_return_t _kernelrpc_mach_port_allocate_trap(
 				mach_port_name_t target,
 				mach_port_right_t right,
@@ -215,6 +224,33 @@ extern kern_return_t _kernelrpc_mach_port_extract_member_trap(
 				mach_port_name_t target,
 				mach_port_name_t name,
 				mach_port_name_t pset
+);
+
+extern kern_return_t _kernelrpc_mach_port_construct_trap(
+				mach_port_name_t target,
+				mach_port_options_t *options,
+				uint64_t context,
+				mach_port_name_t *name
+);
+
+extern kern_return_t _kernelrpc_mach_port_destruct_trap(
+				mach_port_name_t target,
+				mach_port_name_t name,
+				mach_port_delta_t srdelta,
+				uint64_t guard
+);
+
+extern kern_return_t _kernelrpc_mach_port_guard_trap(
+				mach_port_name_t target,
+				mach_port_name_t name,
+				uint64_t guard,
+				boolean_t strict
+);
+
+extern kern_return_t _kernelrpc_mach_port_unguard_trap(
+				mach_port_name_t target,
+				mach_port_name_t name,
+				uint64_t guard
 );
 
 extern kern_return_t macx_swapon(
@@ -268,18 +304,6 @@ extern kern_return_t pid_for_task(
 				mach_port_name_t t,
 				int *x);
 
-#if		!defined(__LP64__) && !defined(__arm__)
-/* these should go away altogether - so no 64 legacy please */
-
-extern kern_return_t map_fd(
-				int fd,
-				vm_offset_t offset,
-				vm_offset_t *va,
-				boolean_t findspace,
-				vm_size_t size);
-
-#endif	/* !defined(__LP64__) && !defined(__arm__) */
-
 #else	/* KERNEL */
 
 #ifdef	XNU_KERNEL_PRIVATE
@@ -289,9 +313,15 @@ extern kern_return_t map_fd(
  * The kernel may support multiple userspace ABIs, and must use
  * argument structures with elements large enough for any of them.
  */
+#if CONFIG_REQUIRES_U32_MUNGING
 #define	PAD_(t)	(sizeof(uint64_t) <= sizeof(t) \
  		? 0 : sizeof(uint64_t) - sizeof(t))
 #define PAD_ARG_8
+#else
+#define	PAD_(t)	(sizeof(uint32_t) <= sizeof(t) \
+ 		? 0 : sizeof(uint32_t) - sizeof(t))
+#define PAD_ARG_8 char arg8_pad_[sizeof(uint32_t)];
+#endif
 
 #if BYTE_ORDER == LITTLE_ENDIAN
 #define	PADL_(t)	0
@@ -310,33 +340,6 @@ extern kern_return_t map_fd(
  * active architectures do this inline in the code to dispatch Mach
  * traps, without calling out to the BSD system call mungers.
  */
-
-#if 0 /* no active architectures use this */
-void munge_w(const void *, void *);  
-void munge_ww(const void *, void *);  
-void munge_www(const void *, void *);  
-void munge_wwww(const void *, void *);  
-void munge_wwwww(const void *, void *);  
-void munge_wwwwww(const void *, void *);  
-void munge_wwwwwww(const void *, void *);  
-void munge_wwwwwwww(const void *, void *);  
-void munge_d(const void *, void *);  
-void munge_dd(const void *, void *);  
-void munge_ddd(const void *, void *);  
-void munge_dddd(const void *, void *);  
-void munge_ddddd(const void *, void *);  
-void munge_dddddd(const void *, void *);  
-void munge_ddddddd(const void *, void *);  
-void munge_dddddddd(const void *, void *);
-void munge_l(const void *, void *);
-void munge_lw(const void *, void *);
-void munge_lwww(const void *, void *);
-void munge_wl(const void *, void *);  
-void munge_wlw(const void *, void *);  
-void munge_wwwl(const void *, void *);  
-void munge_wwwwl(const void *, void *);  
-void munge_wwwwwl(const void *, void *);  
-#endif /* 0 */
 
 struct kern_invalid_args {
 	int32_t dummy;
@@ -432,18 +435,6 @@ struct semaphore_timedwait_signal_trap_args {
 };
 extern kern_return_t semaphore_timedwait_signal_trap(
 				struct semaphore_timedwait_signal_trap_args *args);
-
-#if		!defined(CONFIG_EMBEDDED)
-struct map_fd_args {
-	PAD_ARG_(int, fd);
-	PAD_ARG_(vm_offset_t, offset);
-	PAD_ARG_(vm_offset_t *, va);
-	PAD_ARG_(boolean_t, findspace);
-	PAD_ARG_(vm_size_t, size);
-};
-extern kern_return_t map_fd(
-				struct map_fd_args *args);
-#endif	/* !defined(CONFIG_EMBEDDED) */
 
 struct task_for_pid_args {
 	PAD_ARG_(mach_port_name_t, target_tport);
@@ -607,6 +598,18 @@ struct _kernelrpc_mach_vm_protect_args {
 extern kern_return_t _kernelrpc_mach_vm_protect_trap(
 				struct _kernelrpc_mach_vm_protect_args *args);
 
+struct _kernelrpc_mach_vm_map_trap_args {
+	PAD_ARG_(mach_port_name_t, target);
+	PAD_ARG_(user_addr_t, addr);
+	PAD_ARG_(mach_vm_size_t, size);
+	PAD_ARG_(mach_vm_offset_t, mask);
+	PAD_ARG_(int, flags);
+	PAD_ARG_8
+	PAD_ARG_(vm_prot_t, cur_protection);
+};
+extern kern_return_t _kernelrpc_mach_vm_map_trap(
+				struct _kernelrpc_mach_vm_map_trap_args *args);
+
 struct _kernelrpc_mach_port_allocate_args {
 	PAD_ARG_(mach_port_name_t, target);
 	PAD_ARG_(mach_port_right_t, right);
@@ -671,6 +674,42 @@ struct _kernelrpc_mach_port_extract_member_args {
 };
 extern kern_return_t _kernelrpc_mach_port_extract_member_trap(
 				struct _kernelrpc_mach_port_extract_member_args *args);
+
+struct _kernelrpc_mach_port_construct_args {
+	PAD_ARG_(mach_port_name_t, target);
+	PAD_ARG_(user_addr_t, options);
+	PAD_ARG_(uint64_t, context);
+	PAD_ARG_(user_addr_t, name);
+};
+extern kern_return_t _kernelrpc_mach_port_construct_trap(
+				struct _kernelrpc_mach_port_construct_args *args);
+
+struct _kernelrpc_mach_port_destruct_args {
+	PAD_ARG_(mach_port_name_t, target);
+	PAD_ARG_(mach_port_name_t, name);
+	PAD_ARG_(mach_port_delta_t, srdelta);
+	PAD_ARG_(uint64_t, guard);
+};
+extern kern_return_t _kernelrpc_mach_port_destruct_trap(
+				struct _kernelrpc_mach_port_destruct_args *args);
+
+struct _kernelrpc_mach_port_guard_args {
+	PAD_ARG_(mach_port_name_t, target);
+	PAD_ARG_(mach_port_name_t, name);
+	PAD_ARG_(uint64_t, guard);
+	PAD_ARG_(boolean_t, strict);
+};
+extern kern_return_t _kernelrpc_mach_port_guard_trap(
+				struct _kernelrpc_mach_port_guard_args *args);
+
+struct _kernelrpc_mach_port_unguard_args {
+	PAD_ARG_(mach_port_name_t, target);
+	PAD_ARG_(mach_port_name_t, name);
+	PAD_ARG_(uint64_t, guard);
+};
+extern kern_return_t _kernelrpc_mach_port_unguard_trap(
+				struct _kernelrpc_mach_port_unguard_args *args);
+
 
 /* not published to LP64 clients yet */
 struct iokit_user_client_trap_args {

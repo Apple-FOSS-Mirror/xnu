@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2000-2011 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -76,8 +76,9 @@
 #include <sys/file_internal.h>
 #include <sys/vnode_internal.h>
 #include <sys/malloc.h>
+#include <sys/mcache.h>
 #include <sys/mbuf.h>
-#include <kern/lock.h>
+#include <kern/locks.h>
 #include <sys/domain.h>
 #include <sys/protosw.h>
 #include <sys/signalvar.h>
@@ -87,6 +88,7 @@
 #include <sys/uio_internal.h>
 #include <sys/kauth.h>
 #include <kern/task.h>
+#include <sys/priv.h>
 
 #include <security/audit/audit.h>
 
@@ -101,13 +103,12 @@
 #endif /* MAC_SOCKET_SUBSET */
 
 #define	f_flag f_fglob->fg_flag
-#define	f_type f_fglob->fg_type
+#define	f_type f_fglob->fg_ops->fo_type
 #define	f_msgcount f_fglob->fg_msgcount
 #define	f_cred f_fglob->fg_cred
 #define	f_ops f_fglob->fg_ops
 #define	f_offset f_fglob->fg_offset
 #define	f_data f_fglob->fg_data
-
 
 #define	DBG_LAYER_IN_BEG	NETDBG_CODE(DBG_NETSOCK, 0)
 #define	DBG_LAYER_IN_END	NETDBG_CODE(DBG_NETSOCK, 2)
@@ -123,12 +124,9 @@
 #define	DBG_FNC_SENDFILE_WAIT	NETDBG_CODE(DBG_NETSOCK, ((10 << 8) | 1))
 #define	DBG_FNC_SENDFILE_READ	NETDBG_CODE(DBG_NETSOCK, ((10 << 8) | 2))
 #define	DBG_FNC_SENDFILE_SEND	NETDBG_CODE(DBG_NETSOCK, ((10 << 8) | 3))
+#define	DBG_FNC_SENDMSG_X	NETDBG_CODE(DBG_NETSOCK, (11 << 8))
+#define	DBG_FNC_RECVMSG_X	NETDBG_CODE(DBG_NETSOCK, (12 << 8))
 
-
-#define	HACK_FOR_4056224 1
-#if HACK_FOR_4056224
-static pid_t last_pid_4056224 = 0;
-#endif /* HACK_FOR_4056224 */
 
 /* TODO: should be in header file */
 int falloc_locked(proc_t, struct fileproc **, int *, vfs_context_t, int);
@@ -137,20 +135,38 @@ static int sendit(struct proc *, int, struct user_msghdr *, uio_t, int,
     int32_t *);
 static int recvit(struct proc *, int, struct user_msghdr *, uio_t, user_addr_t,
     int32_t *);
+static int connectit(struct socket *, struct sockaddr *);
 static int getsockaddr(struct socket *, struct sockaddr **, user_addr_t,
     size_t, boolean_t);
 static int getsockaddr_s(struct socket *, struct sockaddr_storage *,
     user_addr_t, size_t, boolean_t);
+static int getsockaddrlist(struct socket *, struct sockaddr_list **,
+    user_addr_t, socklen_t, boolean_t);
 #if SENDFILE
 static void alloc_sendpkt(int, size_t, unsigned int *, struct mbuf **,
     boolean_t);
 #endif /* SENDFILE */
+static int connectx_nocancel(struct proc *, struct connectx_args *, int *);
+static int connectitx(struct socket *, struct sockaddr_list **,
+    struct sockaddr_list **, struct proc *, uint32_t, associd_t, connid_t *);
+static int peeloff_nocancel(struct proc *, struct peeloff_args *, int *);
+static int disconnectx_nocancel(struct proc *, struct disconnectx_args *,
+    int *);
+static int socket_common(struct proc *, int, int, int, pid_t, int32_t *, int);
+
+static int internalize_user_msghdr_array(const void *, int, int, u_int,
+			struct user_msghdr_x *, struct uio **);
+static u_int externalize_user_msghdr_array(void *, int, int, u_int,
+			 const struct user_msghdr_x *, struct uio **);
+
+static void free_uio_array(struct uio **, u_int);
+static int uio_array_is_valid(struct uio **, u_int);
 
 /*
  * System call interface to the socket abstraction.
  */
 
-extern	struct fileops socketops;
+extern const struct fileops socketops;
 
 /*
  * Returns:	0			Success
@@ -163,46 +179,68 @@ extern	struct fileops socketops;
  *	socreate:EPROTONOSUPPORT
  *	socreate:ENOBUFS
  *	socreate:ENOMEM
- *	socreate:EISCONN
  *	socreate:???			[other protocol families, IPSEC]
  */
 int
-socket(struct proc *p, struct socket_args *uap, int32_t *retval)
+socket(struct proc *p,
+	struct socket_args *uap,
+	int32_t *retval)
+{
+	return (socket_common(p, uap->domain, uap->type, uap->protocol,
+	    proc_selfpid(), retval, 0));
+}
+
+int
+socket_delegate(struct proc *p,
+		struct socket_delegate_args *uap,
+		int32_t *retval)
+{
+	return socket_common(p, uap->domain, uap->type, uap->protocol,
+	    uap->epid, retval, 1);
+}
+
+static int
+socket_common(struct proc *p,
+		int domain,
+		int type,
+		int protocol,
+		pid_t epid,
+		int32_t *retval,
+		int delegate)
 {
 	struct socket *so;
 	struct fileproc *fp;
 	int fd, error;
 
-	AUDIT_ARG(socket, uap->domain, uap->type, uap->protocol);
+	AUDIT_ARG(socket, domain, type, protocol);
 #if CONFIG_MACF_SOCKET_SUBSET
-	if ((error = mac_socket_check_create(kauth_cred_get(), uap->domain,
-	    uap->type, uap->protocol)) != 0)
+	if ((error = mac_socket_check_create(kauth_cred_get(), domain,
+	    type, protocol)) != 0)
 		return (error);
 #endif /* MAC_SOCKET_SUBSET */
+
+	if (delegate) {
+		error = priv_check_cred(kauth_cred_get(),
+		    PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, 0);
+		if (error)
+			return (EACCES);
+	}
 
 	error = falloc(p, &fp, &fd, vfs_context_current());
 	if (error) {
 		return (error);
 	}
 	fp->f_flag = FREAD|FWRITE;
-	fp->f_type = DTYPE_SOCKET;
 	fp->f_ops = &socketops;
 
-	error = socreate(uap->domain, &so, uap->type, uap->protocol);
+	if (delegate)
+		error = socreate_delegate(domain, &so, type, protocol, epid);
+	else
+		error = socreate(domain, &so, type, protocol);
+
 	if (error) {
 		fp_free(p, fd, fp);
 	} else {
-		thread_t			thread;
-		struct uthread		*ut;
-		
-		thread = current_thread();
-		ut = get_bsdthread_info(thread);
-			
-		/* if this is a backgrounded thread then throttle all new sockets */
-		if (proc_get_selfthread_isbackground() != 0) {
-			so->so_traffic_mgt_flags |= TRAFFIC_MGT_SO_BACKGROUND;
-			so->so_background_thread = thread;
-		}
 		fp->f_data = (caddr_t)so;
 
 		proc_fdlock(p);
@@ -227,7 +265,7 @@ socket(struct proc *p, struct socket_args *uap, int32_t *retval)
  *	getsockaddr:EINVAL		Invalid argument
  *	getsockaddr:ENOMEM		Not enough space
  *	getsockaddr:EFAULT		Bad address
- *	sobind:???
+ *	sobindlock:???
  */
 /* ARGSUSED */
 int
@@ -265,9 +303,9 @@ bind(__unused proc_t p, struct bind_args *uap, __unused int32_t *retval)
 	AUDIT_ARG(sockaddr, vfs_context_cwd(vfs_context_current()), sa);
 #if CONFIG_MACF_SOCKET_SUBSET
 	if ((error = mac_socket_check_bind(kauth_cred_get(), so, sa)) == 0)
-		error = sobind(so, sa);
+		error = sobindlock(so, sa, 1);	/* will lock socket */
 #else
-		error = sobind(so, sa);
+		error = sobindlock(so, sa, 1);	/* will lock socket */
 #endif /* MAC_SOCKET_SUBSET */
 	if (want_free)
 		FREE(sa, M_SONAME);
@@ -447,8 +485,10 @@ accept_nocancel(struct proc *p, struct accept_nocancel_args *uap,
 	 * the file descriptor should the MAC check fails.
 	 */
 	if ((error = mac_socket_check_accepted(kauth_cred_get(), so)) != 0) {
+		socket_lock(so, 1);
 		so->so_state &= ~(SS_NOFDREF | SS_COMP);
 		so->so_head = NULL;
+		socket_unlock(so, 1);
 		soclose(so);
 		/* Drop reference on listening socket */
 		sodereference(head);
@@ -470,29 +510,50 @@ accept_nocancel(struct proc *p, struct accept_nocancel_args *uap,
 	fflag = fp->f_flag;
 	error = falloc(p, &fp, &newfd, vfs_context_current());
 	if (error) {
-		/* 
+		/*
 		 * Probably ran out of file descriptors.
 		 *
 		 * <rdar://problem/8554930>
 		 * Don't put this back on the socket like we used to, that
 		 * just causes the client to spin. Drop the socket.
 		 */
+		socket_lock(so, 1);
 		so->so_state &= ~(SS_NOFDREF | SS_COMP);
 		so->so_head = NULL;
+		socket_unlock(so, 1);
 		soclose(so);
 		sodereference(head);
 		goto out;
 	}
 	*retval = newfd;
-	fp->f_type = DTYPE_SOCKET;
 	fp->f_flag = fflag;
 	fp->f_ops = &socketops;
 	fp->f_data = (caddr_t)so;
+
 	socket_lock(head, 0);
 	if (dosocklock)
 		socket_lock(so, 1);
+
 	so->so_state &= ~SS_COMP;
 	so->so_head = NULL;
+
+	/* Sync socket non-blocking/async state with file flags */
+	if (fp->f_flag & FNONBLOCK) {
+		so->so_state |= SS_NBIO;
+	} else {
+		so->so_state &= ~SS_NBIO;
+	}
+
+	if (fp->f_flag & FASYNC) {
+		so->so_state |= SS_ASYNC;
+		so->so_rcv.sb_flags |= SB_ASYNC;
+		so->so_snd.sb_flags |= SB_ASYNC;
+	} else {
+		so->so_state &= ~SS_ASYNC;
+		so->so_rcv.sb_flags &= ~SB_ASYNC;
+		so->so_snd.sb_flags &= ~SB_ASYNC;
+	}
+
 	(void) soacceptlock(so, &sa, 0);
 	socket_unlock(head, 1);
 	if (sa == NULL) {
@@ -581,13 +642,12 @@ connect(struct proc *p, struct connect_args *uap, int32_t *retval)
 }
 
 int
-connect_nocancel(__unused proc_t p, struct connect_nocancel_args *uap, __unused int32_t *retval)
+connect_nocancel(proc_t p, struct connect_nocancel_args *uap, int32_t *retval)
 {
+#pragma unused(p, retval)
 	struct socket *so;
 	struct sockaddr_storage ss;
 	struct sockaddr *sa = NULL;
-	lck_mtx_t *mutex_held;
-	boolean_t want_free = TRUE;
 	int error;
 	int fd = uap->s;
 	boolean_t dgram;
@@ -612,65 +672,314 @@ connect_nocancel(__unused proc_t p, struct connect_nocancel_args *uap, __unused 
 		error = getsockaddr(so, &sa, uap->name, uap->namelen, !dgram);
 	} else {
 		error = getsockaddr_s(so, &ss, uap->name, uap->namelen, !dgram);
-		if (error == 0) {
+		if (error == 0)
 			sa = (struct sockaddr *)&ss;
-			want_free = FALSE;
-		}
 	}
 	if (error != 0)
 		goto out;
 
-	AUDIT_ARG(sockaddr, vfs_context_cwd(vfs_context_current()), sa);
-#if CONFIG_MACF_SOCKET_SUBSET
-	if ((error = mac_socket_check_connect(kauth_cred_get(), so, sa)) != 0) {
-		if (want_free)
-			FREE(sa, M_SONAME);
+	error = connectit(so, sa);
+
+	if (sa != NULL && sa != SA(&ss))
+		FREE(sa, M_SONAME);
+	if (error == ERESTART)
+		error = EINTR;
+out:
+	file_drop(fd);
+	return (error);
+}
+
+static int
+connectx_nocancel(struct proc *p, struct connectx_args *uap, int *retval)
+{
+#pragma unused(p, retval)
+	struct sockaddr_list *src_sl = NULL, *dst_sl = NULL;
+	struct socket *so;
+	int error, fd = uap->s;
+	boolean_t dgram;
+	connid_t cid = CONNID_ANY;
+
+	AUDIT_ARG(fd, uap->s);
+	error = file_socket(fd, &so);
+	if (error != 0)
+		return (error);
+	if (so == NULL) {
+		error = EBADF;
 		goto out;
 	}
-#endif /* MAC_SOCKET_SUBSET */
-	socket_lock(so, 1);
 
+	/*
+	 * XXX Workaround to ensure connectx does not fail because
+	 * of unreaped so_error.
+	 */
+	so->so_error = 0;
+
+	/*
+	 * Ask getsockaddr{_s} to not translate AF_UNSPEC to AF_INET
+	 * if this is a datagram socket; translate for other types.
+	 */
+	dgram = (so->so_type == SOCK_DGRAM);
+
+	/*
+	 * Get socket address(es) now before we obtain socket lock; use
+	 * sockaddr_list for src address for convenience, if present,
+	 * even though it won't hold more than one.
+	 */
+	if (uap->src != USER_ADDR_NULL && (error = getsockaddrlist(so,
+	    &src_sl, uap->src, uap->srclen, dgram)) != 0)
+		goto out;
+
+	error = getsockaddrlist(so, &dst_sl, uap->dsts, uap->dstlen, dgram);
+	if (error != 0)
+		goto out;
+
+	VERIFY(dst_sl != NULL &&
+	    !TAILQ_EMPTY(&dst_sl->sl_head) && dst_sl->sl_cnt > 0);
+
+	error = connectitx(so, &src_sl, &dst_sl, p, uap->ifscope,
+	    uap->aid, &cid);
+	if (error == ERESTART)
+		error = EINTR;
+
+	if (uap->cid != USER_ADDR_NULL)
+		(void) copyout(&cid, uap->cid, sizeof (cid));
+
+out:
+	file_drop(fd);
+	if (src_sl != NULL)
+		sockaddrlist_free(src_sl);
+	if (dst_sl != NULL)
+		sockaddrlist_free(dst_sl);
+	return (error);
+}
+
+int
+connectx(struct proc *p, struct connectx_args *uap, int *retval)
+{
+	/*
+	 * Due to similiarity with a POSIX interface, define as
+	 * an unofficial cancellation point.
+	 */
+	__pthread_testcancel(1);
+	return (connectx_nocancel(p, uap, retval));
+}
+
+static int
+connectit(struct socket *so, struct sockaddr *sa)
+{
+	int error;
+
+	AUDIT_ARG(sockaddr, vfs_context_cwd(vfs_context_current()), sa);
+#if CONFIG_MACF_SOCKET_SUBSET
+	if ((error = mac_socket_check_connect(kauth_cred_get(), so, sa)) != 0)
+		return (error);
+#endif /* MAC_SOCKET_SUBSET */
+
+	socket_lock(so, 1);
 	if ((so->so_state & SS_NBIO) && (so->so_state & SS_ISCONNECTING)) {
-		if (want_free)
-			FREE(sa, M_SONAME);
-		socket_unlock(so, 1);
 		error = EALREADY;
 		goto out;
 	}
 	error = soconnectlock(so, sa, 0);
-	if (error)
-		goto bad;
+	if (error != 0) {
+		so->so_state &= ~SS_ISCONNECTING;
+		goto out;
+	}
 	if ((so->so_state & SS_NBIO) && (so->so_state & SS_ISCONNECTING)) {
-		if (want_free)
-			FREE(sa, M_SONAME);
-		socket_unlock(so, 1);
 		error = EINPROGRESS;
 		goto out;
 	}
 	while ((so->so_state & SS_ISCONNECTING) && so->so_error == 0) {
+		lck_mtx_t *mutex_held;
+
 		if (so->so_proto->pr_getlock != NULL)
 			mutex_held = (*so->so_proto->pr_getlock)(so, 0);
 		else
 			mutex_held = so->so_proto->pr_domain->dom_mtx;
 		error = msleep((caddr_t)&so->so_timeo, mutex_held,
-		    PSOCK | PCATCH, "connect", 0);
-		if ((so->so_state & SS_DRAINING)) {
+		    PSOCK | PCATCH, __func__, 0);
+		if (so->so_state & SS_DRAINING) {
 			error = ECONNABORTED;
 		}
-		if (error)
+		if (error != 0)
 			break;
 	}
 	if (error == 0) {
 		error = so->so_error;
 		so->so_error = 0;
 	}
-bad:
-	so->so_state &= ~SS_ISCONNECTING;
+out:
 	socket_unlock(so, 1);
-	if (want_free)
-		FREE(sa, M_SONAME);
-	if (error == ERESTART)
-		error = EINTR;
+	return (error);
+}
+
+static int
+connectitx(struct socket *so, struct sockaddr_list **src_sl,
+    struct sockaddr_list **dst_sl, struct proc *p, uint32_t ifscope,
+    associd_t aid, connid_t *pcid)
+{
+	struct sockaddr_entry *se;
+	int error;
+
+	VERIFY(dst_sl != NULL && *dst_sl != NULL);
+
+	TAILQ_FOREACH(se, &(*dst_sl)->sl_head, se_link) {
+		VERIFY(se->se_addr != NULL);
+		AUDIT_ARG(sockaddr, vfs_context_cwd(vfs_context_current()),
+		    se->se_addr);
+#if CONFIG_MACF_SOCKET_SUBSET
+		if ((error = mac_socket_check_connect(kauth_cred_get(),
+		    so, se->se_addr)) != 0)
+			return (error);
+#endif /* MAC_SOCKET_SUBSET */
+	}
+
+	socket_lock(so, 1);
+	if ((so->so_state & SS_NBIO) && (so->so_state & SS_ISCONNECTING)) {
+		error = EALREADY;
+		goto out;
+	}
+	error = soconnectxlocked(so, src_sl, dst_sl, p, ifscope,
+	    aid, pcid, 0, NULL, 0);
+	if (error != 0) {
+		so->so_state &= ~SS_ISCONNECTING;
+		goto out;
+	}
+	if ((so->so_state & SS_NBIO) && (so->so_state & SS_ISCONNECTING)) {
+		error = EINPROGRESS;
+		goto out;
+	}
+	while ((so->so_state & SS_ISCONNECTING) && so->so_error == 0) {
+		lck_mtx_t *mutex_held;
+
+		if (so->so_proto->pr_getlock != NULL)
+			mutex_held = (*so->so_proto->pr_getlock)(so, 0);
+		else
+			mutex_held = so->so_proto->pr_domain->dom_mtx;
+		error = msleep((caddr_t)&so->so_timeo, mutex_held,
+		    PSOCK | PCATCH, __func__, 0);
+		if (so->so_state & SS_DRAINING) {
+			error = ECONNABORTED;
+		}
+		if (error != 0)
+			break;
+	}
+	if (error == 0) {
+		error = so->so_error;
+		so->so_error = 0;
+	}
+out:
+	socket_unlock(so, 1);
+	return (error);
+}
+
+int
+peeloff(struct proc *p, struct peeloff_args *uap, int *retval)
+{
+	/*
+	 * Due to similiarity with a POSIX interface, define as
+	 * an unofficial cancellation point.
+	 */
+	__pthread_testcancel(1);
+	return (peeloff_nocancel(p, uap, retval));
+}
+
+static int
+peeloff_nocancel(struct proc *p, struct peeloff_args *uap, int *retval)
+{
+	struct fileproc *fp;
+	struct socket *mp_so, *so = NULL;
+	int newfd, fd = uap->s;
+	short fflag;		/* type must match fp->f_flag */
+	int error;
+
+	*retval = -1;
+
+	error = fp_getfsock(p, fd, &fp, &mp_so);
+	if (error != 0) {
+		if (error == EOPNOTSUPP)
+			error = ENOTSOCK;
+		goto out_nofile;
+	}
+	if (mp_so == NULL) {
+		error = EBADF;
+		goto out;
+	}
+
+	socket_lock(mp_so, 1);
+	error = sopeelofflocked(mp_so, uap->aid, &so);
+	if (error != 0) {
+		socket_unlock(mp_so, 1);
+		goto out;
+	}
+	VERIFY(so != NULL);
+	socket_unlock(mp_so, 0);		/* keep ref on mp_so for us */
+
+	fflag = fp->f_flag;
+	error = falloc(p, &fp, &newfd, vfs_context_current());
+	if (error != 0) {
+		/* drop this socket (probably ran out of file descriptors) */
+		soclose(so);
+		sodereference(mp_so);		/* our mp_so ref */
+		goto out;
+	}
+
+	fp->f_flag = fflag;
+	fp->f_ops = &socketops;
+	fp->f_data = (caddr_t)so;
+
+	/*
+	 * If the socket has been marked as inactive by sosetdefunct(),
+	 * disallow further operations on it.
+	 */
+	if (so->so_flags & SOF_DEFUNCT) {
+		sodefunct(current_proc(), so,
+		    SHUTDOWN_SOCKET_LEVEL_DISCONNECT_INTERNAL);
+	}
+
+	proc_fdlock(p);
+	procfdtbl_releasefd(p, newfd, NULL);
+	fp_drop(p, newfd, fp, 1);
+	proc_fdunlock(p);
+
+	sodereference(mp_so);			/* our mp_so ref */
+	*retval = newfd;
+
+out:
+	file_drop(fd);
+
+out_nofile:
+	return (error);
+}
+
+int
+disconnectx(struct proc *p, struct disconnectx_args *uap, int *retval)
+{
+	/*
+	 * Due to similiarity with a POSIX interface, define as
+	 * an unofficial cancellation point.
+	 */
+	__pthread_testcancel(1);
+	return (disconnectx_nocancel(p, uap, retval));
+}
+
+static int
+disconnectx_nocancel(struct proc *p, struct disconnectx_args *uap, int *retval)
+{
+#pragma unused(p, retval)
+	struct socket *so;
+	int fd = uap->s;
+	int error;
+
+	error = file_socket(fd, &so);
+	if (error != 0)
+		return (error);
+	if (so == NULL) {
+		error = EBADF;
+		goto out;
+	}
+
+	error = sodisconnectx(so, uap->aid, uap->cid);
 out:
 	file_drop(fd);
 	return (error);
@@ -714,7 +1023,6 @@ socketpair(struct proc *p, struct socketpair_args *uap,
 		goto free2;
 	}
 	fp1->f_flag = FREAD|FWRITE;
-	fp1->f_type = DTYPE_SOCKET;
 	fp1->f_ops = &socketops;
 	fp1->f_data = (caddr_t)so1;
 	sv[0] = fd;
@@ -724,7 +1032,6 @@ socketpair(struct proc *p, struct socketpair_args *uap,
 		goto free3;
 	}
 	fp2->f_flag = FREAD|FWRITE;
-	fp2->f_type = DTYPE_SOCKET;
 	fp2->f_ops = &socketops;
 	fp2->f_data = (caddr_t)so2;
 	sv[1] = fd;
@@ -868,8 +1175,8 @@ sendit(struct proc *p, int s, struct user_msghdr *mp, uio_t uiop,
 #endif /* MAC_SOCKET_SUBSET */
 
 	len = uio_resid(uiop);
-	error = so->so_proto->pr_usrreqs->pru_sosend(so, to, uiop, 0, control,
-	    flags);
+	error = so->so_proto->pr_usrreqs->pru_sosend(so, to, uiop, 0,
+		control, flags);
 	if (error != 0) {
 		if (uio_resid(uiop) != len && (error == ERESTART ||
 		    error == EINTR || error == EWOULDBLOCK))
@@ -899,11 +1206,13 @@ int
 sendto(struct proc *p, struct sendto_args *uap, int32_t *retval)
 {
 	__pthread_testcancel(1);
-	return(sendto_nocancel(p, (struct sendto_nocancel_args *)uap, retval));
+	return (sendto_nocancel(p, (struct sendto_nocancel_args *)uap, retval));
 }
 
 int
-sendto_nocancel(struct proc *p, struct sendto_nocancel_args *uap, int32_t *retval)
+sendto_nocancel(struct proc *p,
+		struct sendto_nocancel_args *uap,
+		int32_t *retval)
 {
 	struct user_msghdr msg;
 	int error;
@@ -934,42 +1243,6 @@ sendto_nocancel(struct proc *p, struct sendto_nocancel_args *uap, int32_t *retva
 		uio_free(auio);
 	}
 
-#if HACK_FOR_4056224
-	/*
-	 * Radar 4056224
-	 * Temporary workaround to let send() and recv() work over
-	 * a pipe for binary compatibility
-	 * This will be removed in the release following Tiger
-	 */
-	if (error == ENOTSOCK) {
-		struct fileproc *fp;
-
-		if (fp_lookup(p, uap->s, &fp, 0) == 0) {
-			(void) fp_drop(p, uap->s, fp, 0);
-
-			if (fp->f_type == DTYPE_PIPE) {
-				struct write_args write_uap;
-				user_ssize_t write_retval;
-
-				if (p->p_pid > last_pid_4056224) {
-					last_pid_4056224 = p->p_pid;
-
-					printf("%s[%d] uses send/recv "
-					    "on a pipe\n", p->p_comm, p->p_pid);
-				}
-
-				bzero(&write_uap, sizeof (struct write_args));
-				write_uap.fd = uap->s;
-				write_uap.cbuf = uap->buf;
-				write_uap.nbyte = uap->len;
-
-				error = write(p, &write_uap, &write_retval);
-				*retval = (int)write_retval;
-			}
-		}
-	}
-#endif /* HACK_FOR_4056224 */
-
 	KERNEL_DEBUG(DBG_FNC_SENDTO | DBG_FUNC_END, error, *retval, 0, 0, 0);
 
 	return (error);
@@ -985,7 +1258,7 @@ int
 sendmsg(struct proc *p, struct sendmsg_args *uap, int32_t *retval)
 {
 	__pthread_testcancel(1);
-	return(sendmsg_nocancel(p, (struct sendmsg_nocancel_args *)uap, retval));
+	return (sendmsg_nocancel(p, (struct sendmsg_nocancel_args *)uap, retval));
 }
 
 int
@@ -1066,7 +1339,10 @@ sendmsg_nocancel(struct proc *p, struct sendmsg_nocancel_args *uap, int32_t *ret
 		user_msg.msg_iov = CAST_USER_ADDR_T(iovp);
 
 		/* finish setup of uio_t */
-		uio_calculateresid(auio);
+		error = uio_calculateresid(auio);
+		if (error) {
+			goto done;
+		}
 	} else {
 		user_msg.msg_iov = 0;
 	}
@@ -1080,6 +1356,174 @@ done:
 		uio_free(auio);
 	}
 	KERNEL_DEBUG(DBG_FNC_SENDMSG | DBG_FUNC_END, error, 0, 0, 0, 0);
+
+	return (error);
+}
+
+int
+sendmsg_x(struct proc *p, struct sendmsg_x_args *uap, user_ssize_t *retval)
+{
+	int error = 0;
+	struct user_msghdr_x *user_msg = NULL;
+	struct uio **uiop = NULL;
+	struct socket *so;
+	u_int i;
+	struct sockaddr *to = NULL;
+	struct mbuf *control = NULL;
+	user_ssize_t len_before = 0, len_after;
+	int need_drop = 0;
+	size_t size_of_msghdr;
+	void *umsgp = NULL;
+	u_int uiocnt;
+
+	KERNEL_DEBUG(DBG_FNC_SENDMSG_X | DBG_FUNC_START, 0, 0, 0, 0, 0);
+
+	error = file_socket(uap->s, &so);
+	if (error) {
+		goto out;
+	}
+	need_drop = 1;
+	if (so == NULL) {
+		error = EBADF;
+		goto out;
+	}
+	if (so->so_proto->pr_usrreqs->pru_sosend_list == NULL) {
+		printf("%s no pru_sosend_list\n", __func__);
+		error = EOPNOTSUPP;
+		goto out;
+	}
+
+	/*
+	 * Input parameter range check
+	 */
+	if (uap->cnt == 0 || uap->cnt > UIO_MAXIOV) {
+		error = EINVAL;
+		goto out;
+	}
+	user_msg = _MALLOC(uap->cnt * sizeof(struct user_msghdr_x), 
+			M_TEMP, M_WAITOK | M_ZERO);
+	if (user_msg == NULL) {
+		printf("%s _MALLOC() user_msg failed\n", __func__);
+		error = ENOMEM;
+		goto out;
+	}
+	uiop = _MALLOC(uap->cnt * sizeof(struct uio *),
+		M_TEMP, M_WAITOK | M_ZERO);
+	if (uiop == NULL) {
+		printf("%s _MALLOC() uiop failed\n", __func__);
+		error = ENOMEM;
+		goto out;
+	}
+
+	size_of_msghdr = IS_64BIT_PROCESS(p) ?
+		sizeof(struct user64_msghdr_x) : sizeof(struct user32_msghdr_x);
+
+	umsgp = _MALLOC(uap->cnt * size_of_msghdr, 
+			M_TEMP, M_WAITOK | M_ZERO);
+	if (umsgp == NULL) {
+		printf("%s _MALLOC() user_msg failed\n", __func__);
+		error = ENOMEM;
+		goto out;
+	}
+	error = copyin(uap->msgp, umsgp, uap->cnt * size_of_msghdr);
+	if (error) {
+		printf("%s copyin() failed\n", __func__);
+		goto out;
+	}
+	error = internalize_user_msghdr_array(umsgp,
+		IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32,
+		UIO_WRITE, uap->cnt, user_msg, uiop);
+	if (error) {
+		printf("%s copyin_user_msghdr_array() failed\n", __func__);
+		goto out;
+	}
+	/*
+	 * Make sure the size of each message iovec and
+	 * the aggregate size of all the iovec is valid
+	 */
+	if (uio_array_is_valid(uiop, uap->cnt) == 0) {
+		error = EINVAL;
+		goto out;
+	}
+
+	/*
+	 * Sanity check on passed arguments
+	 */
+	for (i = 0; i < uap->cnt; i++) {
+		struct user_msghdr_x *mp = &user_msg[i];
+
+		/*
+		 * No flags on send message
+		 */
+		if (mp->msg_flags != 0) {
+			error = EINVAL;
+			goto out;
+		}
+		/*
+		 * No support for address or ancillary data (yet)
+		 */
+		if (mp->msg_name != USER_ADDR_NULL || mp->msg_namelen != 0) {
+			error = EINVAL;
+			goto out;
+		}
+		if (mp->msg_control != USER_ADDR_NULL ||
+		    mp->msg_controllen != 0) {
+			error = EINVAL;
+			goto out;
+		}
+#if CONFIG_MACF_SOCKET_SUBSET
+		/*
+		 * We check the state without holding the socket lock;
+		 * if a race condition occurs, it would simply result
+		 * in an extra call to the MAC check function. 
+		 *
+		 * Note: The following check is never true taken with the
+		 * current limitation that we do not accept to pass an address,
+		 * this is effectively placeholder code. If we add support for addresses,
+		 * we will have to check every address.
+		 */
+		if ( to != NULL &&
+		    !(so->so_state & SS_DEFUNCT) &&
+		    (error = mac_socket_check_send(kauth_cred_get(), so, to)) != 0)
+			goto out;
+#endif /* MAC_SOCKET_SUBSET */
+	}
+
+	len_before = uio_array_resid(uiop, uap->cnt);
+
+	error = so->so_proto->pr_usrreqs->pru_sosend_list(so, to, uiop, 
+		uap->cnt, 0, control, uap->flags);
+
+	len_after = uio_array_resid(uiop, uap->cnt);
+
+	if (error != 0) {
+		if (len_after != len_before && (error == ERESTART ||
+		    error == EINTR || error == EWOULDBLOCK))
+			error = 0;
+		/* Generation of SIGPIPE can be controlled per socket */
+		if (error == EPIPE && !(so->so_flags & SOF_NOSIGPIPE))
+			psignal(p, SIGPIPE);
+	}
+	if (error == 0) {
+		uiocnt = externalize_user_msghdr_array(umsgp,
+		    IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32,
+		    UIO_WRITE, uap->cnt, user_msg, uiop);
+
+		*retval = (int)(uiocnt);
+	}
+out:
+	if (need_drop)
+		file_drop(uap->s);
+	if (umsgp != NULL)
+		_FREE(umsgp, M_TEMP);
+	if (uiop != NULL) {
+		free_uio_array(uiop, uap->cnt);
+		_FREE(uiop, M_TEMP);
+	}
+	if (user_msg != NULL)
+		_FREE(user_msg, M_TEMP);
+
+	KERNEL_DEBUG(DBG_FNC_SENDMSG_X | DBG_FUNC_END, error, 0, 0, 0, 0);
 
 	return (error);
 }
@@ -1110,7 +1554,8 @@ static int
 recvit(struct proc *p, int s, struct user_msghdr *mp, uio_t uiop,
     user_addr_t namelenp, int32_t *retval)
 {
-	int len, error;
+	ssize_t len;
+	int error;
 	struct mbuf *m, *control = 0;
 	user_addr_t ctlbuf;
 	struct socket *so;
@@ -1147,6 +1592,7 @@ recvit(struct proc *p, int s, struct user_msghdr *mp, uio_t uiop,
 	 */
 	if (!(so->so_state & SS_DEFUNCT) &&
 	    !(so->so_state & SS_ISCONNECTED) &&
+	    !(so->so_proto->pr_flags & PR_CONNREQUIRED) &&
 	    (error = mac_socket_check_receive(kauth_cred_get(), so)) != 0)
 		goto out1;
 #endif /* MAC_SOCKET_SUBSET */
@@ -1208,9 +1654,9 @@ recvit(struct proc *p, int s, struct user_msghdr *mp, uio_t uiop,
 			struct cmsghdr *cp = mtod(m, struct cmsghdr *);
 			int cp_size = CMSG_ALIGN(cp->cmsg_len);
 			int buflen = m->m_len;
-			
+
 			while (buflen > 0 && len > 0) {
-				
+
 				/* 
 				 SCM_TIMESTAMP hack because  struct timeval has a 
 				 * different size for 32 bits and 64 bits processes
@@ -1220,24 +1666,24 @@ recvit(struct proc *p, int s, struct user_msghdr *mp, uio_t uiop,
 					struct cmsghdr *tmp_cp = (struct cmsghdr *)(void *)tmp_buffer;
 					int tmp_space;
 					struct timeval *tv = (struct timeval *)(void *)CMSG_DATA(cp);
-					
+
 					tmp_cp->cmsg_level = SOL_SOCKET;
 					tmp_cp->cmsg_type = SCM_TIMESTAMP;
-					
+
 					if (proc_is64bit(p)) {
 						struct user64_timeval *tv64 = (struct user64_timeval *)(void *)CMSG_DATA(tmp_cp);
-						
+
 						tv64->tv_sec = tv->tv_sec;
 						tv64->tv_usec = tv->tv_usec;
-						
+
 						tmp_cp->cmsg_len = CMSG_LEN(sizeof(struct user64_timeval));
 						tmp_space = CMSG_SPACE(sizeof(struct user64_timeval));
 					} else {
 						struct user32_timeval *tv32 = (struct user32_timeval *)(void *)CMSG_DATA(tmp_cp);
-						
+
 						tv32->tv_sec = tv->tv_sec;
 						tv32->tv_usec = tv->tv_usec;
-						
+
 						tmp_cp->cmsg_len = CMSG_LEN(sizeof(struct user32_timeval));
 						tmp_space = CMSG_SPACE(sizeof(struct user32_timeval));
 					}
@@ -1250,35 +1696,35 @@ recvit(struct proc *p, int s, struct user_msghdr *mp, uio_t uiop,
 					error = copyout(tmp_buffer, ctlbuf, tocopy);
 					if (error)
 						goto out;
-					
+
 				} else {
-					
+
 					if (cp_size > buflen) {
 						panic("cp_size > buflen, something wrong with alignment!");
 					}
-					
+
 					if (len >= cp_size) {
 						tocopy = cp_size;
 					} else {
 						mp->msg_flags |= MSG_CTRUNC;
 						tocopy = len;
 					}
-					
+
 					error = copyout((caddr_t) cp, ctlbuf,
 									tocopy);
 					if (error)
 						goto out;
 				}
-				
-				
+
+
 				ctlbuf += tocopy;
 				len -= tocopy;
-				
+
 				buflen -= cp_size;
 				cp = (struct cmsghdr *)(void *)((unsigned char *) cp + cp_size);
 				cp_size = CMSG_ALIGN(cp->cmsg_len);
 			}
-			
+
 			m = m->m_next;
 		}
 		mp->msg_controllen = ctlbuf - mp->msg_control;
@@ -1353,42 +1799,6 @@ recvfrom_nocancel(struct proc *p, struct recvfrom_nocancel_args *uap, int32_t *r
 	if (auio != NULL) {
 		uio_free(auio);
 	}
-
-#if HACK_FOR_4056224
-	/*
-	 * Radar 4056224
-	 * Temporary workaround to let send() and recv() work over
-	 * a pipe for binary compatibility
-	 * This will be removed in the release following Tiger
-	 */
-	if (error == ENOTSOCK && proc_is64bit(p) == 0) {
-		struct fileproc *fp;
-
-		if (fp_lookup(p, uap->s, &fp, 0) == 0) {
-			(void) fp_drop(p, uap->s, fp, 0);
-
-			if (fp->f_type == DTYPE_PIPE) {
-				struct read_args read_uap;
-				user_ssize_t read_retval;
-
-				if (p->p_pid > last_pid_4056224) {
-					last_pid_4056224 = p->p_pid;
-
-					printf("%s[%d] uses send/recv on "
-					    "a pipe\n", p->p_comm, p->p_pid);
-				}
-
-				bzero(&read_uap, sizeof (struct read_args));
-				read_uap.fd = uap->s;
-				read_uap.cbuf = uap->buf;
-				read_uap.nbyte = uap->len;
-
-				error = read(p, &read_uap, &read_retval);
-				*retval = (int)read_retval;
-			}
-		}
-	}
-#endif /* HACK_FOR_4056224 */
 
 	KERNEL_DEBUG(DBG_FNC_RECVFROM | DBG_FUNC_END, error, 0, 0, 0, 0);
 
@@ -1495,7 +1905,10 @@ recvmsg_nocancel(struct proc *p, struct recvmsg_nocancel_args *uap, int32_t *ret
 		goto done;
 
 	/* finish setup of uio_t */
-	uio_calculateresid(auio);
+	error = uio_calculateresid(auio);
+	if (error) {
+		goto done;
+	}
 
 	error = recvit(p, uap->s, &user_msg, auio, 0, retval);
 	if (!error) {
@@ -1524,6 +1937,166 @@ done:
 		uio_free(auio);
 	}
 	KERNEL_DEBUG(DBG_FNC_RECVMSG | DBG_FUNC_END, error, 0, 0, 0, 0);
+	return (error);
+}
+
+int
+recvmsg_x(struct proc *p, struct recvmsg_x_args *uap, user_ssize_t *retval)
+{
+	int error = EOPNOTSUPP;
+	struct user_msghdr_x *user_msg = NULL;
+	struct uio **uiop = NULL;
+	struct socket *so;
+	user_ssize_t len_before = 0, len_after;
+	int need_drop = 0;
+	size_t size_of_msghdr;
+	void *umsgp = NULL;
+	u_int i;
+	u_int uiocnt;
+
+	KERNEL_DEBUG(DBG_FNC_RECVMSG_X | DBG_FUNC_START, 0, 0, 0, 0, 0);
+
+	error = file_socket(uap->s, &so);
+	if (error) {
+		goto out;
+	}
+	need_drop = 1;
+	if (so == NULL) {
+		error = EBADF;
+		goto out;
+	}
+	if (so->so_proto->pr_usrreqs->pru_soreceive_list == NULL) {
+		printf("%s no pru_soreceive_list\n", __func__);
+		error = EOPNOTSUPP;
+		goto out;
+	}
+
+	/*
+	 * Input parameter range check
+	 */
+	if (uap->cnt == 0 || uap->cnt > UIO_MAXIOV) {
+		error = EINVAL;
+		goto out;
+	}
+	user_msg = _MALLOC(uap->cnt * sizeof(struct user_msghdr_x), 
+	    M_TEMP, M_WAITOK | M_ZERO);
+	if (user_msg == NULL) {
+		printf("%s _MALLOC() user_msg failed\n", __func__);
+		error = ENOMEM;
+		goto out;
+	}
+	uiop = _MALLOC(uap->cnt * sizeof(struct uio *),
+	    M_TEMP, M_WAITOK | M_ZERO);
+	if (uiop == NULL) {
+		printf("%s _MALLOC() uiop failed\n", __func__);
+		error = ENOMEM;
+		goto out;
+	}
+
+	size_of_msghdr = IS_64BIT_PROCESS(p) ?
+	    sizeof(struct user64_msghdr_x) : sizeof(struct user32_msghdr_x);
+
+	umsgp = _MALLOC(uap->cnt * size_of_msghdr, M_TEMP, M_WAITOK | M_ZERO);
+	if (umsgp == NULL) {
+		printf("%s _MALLOC() user_msg failed\n", __func__);
+		error = ENOMEM;
+		goto out;
+	}
+	error = copyin(uap->msgp, umsgp, uap->cnt * size_of_msghdr);
+	if (error) {
+		printf("%s copyin() failed\n", __func__);
+		goto out;
+	}
+	error = internalize_user_msghdr_array(umsgp,
+	    IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32,
+	    UIO_READ, uap->cnt, user_msg, uiop);
+	if (error) {
+		printf("%s copyin_user_msghdr_array() failed\n", __func__);
+		goto out;
+	}
+	/*
+	 * Make sure the size of each message iovec and
+	 * the aggregate size of all the iovec is valid
+	 */
+	if (uio_array_is_valid(uiop, uap->cnt) == 0) {
+		error = EINVAL;
+		goto out;
+	}
+
+	/*
+	 * Sanity check on passed arguments
+	 */
+	for (i = 0; i < uap->cnt; i++) {
+		struct user_msghdr_x *mp = &user_msg[i];
+
+		if (mp->msg_flags != 0) {
+			error = EINVAL;
+			goto out;
+		}
+		/*
+		 * No support for address or ancillary data (yet)
+		 */
+		if (mp->msg_name != USER_ADDR_NULL || mp->msg_namelen != 0) {
+			error = EINVAL;
+			goto out;
+		}
+		if (mp->msg_control != USER_ADDR_NULL ||
+		    mp->msg_controllen != 0) {
+			error = EINVAL;
+			goto out;
+		}
+	}
+#if CONFIG_MACF_SOCKET_SUBSET
+	/*
+	 * We check the state without holding the socket lock;
+	 * if a race condition occurs, it would simply result
+	 * in an extra call to the MAC check function.
+	 */
+	if (!(so->so_state & SS_DEFUNCT) &&
+	    !(so->so_state & SS_ISCONNECTED) &&
+	    !(so->so_proto->pr_flags & PR_CONNREQUIRED) &&
+	    (error = mac_socket_check_receive(kauth_cred_get(), so)) != 0)
+		goto out;
+#endif /* MAC_SOCKET_SUBSET */
+
+	len_before = uio_array_resid(uiop, uap->cnt);
+
+	error = so->so_proto->pr_usrreqs->pru_soreceive_list(so, NULL, uiop,
+	    uap->cnt, (struct mbuf **)0, NULL, NULL);
+
+	len_after = uio_array_resid(uiop, uap->cnt);
+
+	if (error) {
+		if (len_after != len_before && (error == ERESTART ||
+		    error == EINTR || error == EWOULDBLOCK))
+			error = 0;
+	}
+	if (error == 0) {
+		uiocnt = externalize_user_msghdr_array(umsgp,
+		    IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32,
+		    UIO_READ, uap->cnt, user_msg, uiop);
+
+		error = copyout(umsgp, uap->msgp, uap->cnt * size_of_msghdr);
+		if (error) {
+			printf("%s copyout() failed\n", __func__);
+			goto out;
+		}
+		*retval = (int)(uiocnt);
+	}
+out:
+	if (need_drop)
+		file_drop(uap->s);
+	if (umsgp != NULL)
+		_FREE(umsgp, M_TEMP);
+	if (uiop != NULL) {
+		free_uio_array(uiop, uap->cnt);
+		_FREE(uiop, M_TEMP);
+	}
+	if (user_msg != NULL)
+		_FREE(user_msg, M_TEMP);
+		
+	KERNEL_DEBUG(DBG_FNC_RECVMSG_X | DBG_FUNC_END, error, 0, 0, 0, 0);
+	
 	return (error);
 }
 
@@ -1618,7 +2191,7 @@ setsockopt(struct proc *p, struct setsockopt_args *uap,
 	    &sopt)) != 0)
 		goto out;
 #endif /* MAC_SOCKET_SUBSET */
-	error = sosetopt(so, &sopt);
+	error = sosetoptlock(so, &sopt, 1);	/* will lock socket */
 out:
 	file_drop(uap->s);
 	return (error);
@@ -1674,7 +2247,7 @@ getsockopt(struct proc *p, struct getsockopt_args  *uap,
 	    &sopt)) != 0)
 		goto out;
 #endif /* MAC_SOCKET_SUBSET */
-	error = sogetopt((struct socket *)so, &sopt);
+	error = sogetoptlock((struct socket *)so, &sopt, 1);	/* will lock */
 	if (error == 0) {
 		valsize = sopt.sopt_valsize;
 		error = copyout((caddr_t)&valsize, uap->avalsize,
@@ -1845,7 +2418,7 @@ sockargs(struct mbuf **mp, user_addr_t data, int buflen, int type)
 	int error;
 
 	size_t alloc_buflen = (size_t)buflen;
-	
+
 	if(alloc_buflen > INT_MAX/2) 
 		return (EINVAL);
 #ifdef __LP64__
@@ -1923,7 +2496,7 @@ getsockaddr(struct socket *so, struct sockaddr **namp, user_addr_t uaddr,
 		 * handle it.
 		 */
 		if (translate_unspec && sa->sa_family == AF_UNSPEC &&
-		    INP_CHECK_SOCKAF(so, AF_INET) &&
+		    SOCK_CHECK_DOM(so, PF_INET) &&
 		    len == sizeof (struct sockaddr_in))
 			sa->sa_family = AF_INET;
 
@@ -1960,7 +2533,7 @@ getsockaddr_s(struct socket *so, struct sockaddr_storage *ss,
 		 * handle it.
 		 */
 		if (translate_unspec && ss->ss_family == AF_UNSPEC &&
-		    INP_CHECK_SOCKAF(so, AF_INET) &&
+		    SOCK_CHECK_DOM(so, PF_INET) &&
 		    len == sizeof (struct sockaddr_in))
 			ss->ss_family = AF_INET;
 
@@ -1969,39 +2542,267 @@ getsockaddr_s(struct socket *so, struct sockaddr_storage *ss,
 	return (error);
 }
 
+/*
+ * Hard limit on the number of source and/or destination addresses
+ * that can be specified by an application.
+ */
+#define	SOCKADDRLIST_MAX_ENTRIES	64
+
+static int
+getsockaddrlist(struct socket *so, struct sockaddr_list **slp,
+    user_addr_t uaddr, socklen_t uaddrlen, boolean_t xlate_unspec)
+{
+	struct sockaddr_list *sl;
+	int error = 0;
+
+	*slp = NULL;
+
+	if (uaddr == USER_ADDR_NULL || uaddrlen == 0)
+		return (EINVAL);
+
+	sl = sockaddrlist_alloc(M_WAITOK);
+	if (sl == NULL)
+		return (ENOMEM);
+
+	VERIFY(sl->sl_cnt == 0);
+	while (uaddrlen > 0 && sl->sl_cnt < SOCKADDRLIST_MAX_ENTRIES) {
+		struct sockaddr_storage ss;
+		struct sockaddr_entry *se;
+		struct sockaddr *sa;
+
+		if (uaddrlen < sizeof (struct sockaddr)) {
+			error = EINVAL;
+			break;
+		}
+
+		bzero(&ss, sizeof (ss));
+		error = copyin(uaddr, (caddr_t)&ss, sizeof (struct sockaddr));
+		if (error != 0)
+			break;
+
+		/* getsockaddr does the same but we need them now */
+		if (uaddrlen < ss.ss_len ||
+		    ss.ss_len < offsetof(struct sockaddr, sa_data[0])) {
+			error = EINVAL;
+			break;
+		} else if (ss.ss_len > sizeof (ss)) {
+			/*
+			 * sockaddr_storage size is less than SOCK_MAXADDRLEN,
+			 * so the check here is inclusive.  We could user the
+			 * latter instead, but seems like an overkill for now.
+			 */
+			error = ENAMETOOLONG;
+			break;
+		}
+
+		se = sockaddrentry_alloc(M_WAITOK);
+		if (se == NULL)
+			break;
+
+		sockaddrlist_insert(sl, se);
+
+		error = getsockaddr(so, &sa, uaddr, ss.ss_len, xlate_unspec);
+		if (error != 0)
+			break;
+
+		VERIFY(sa != NULL && sa->sa_len == ss.ss_len);
+		se->se_addr = sa;
+
+		uaddr += ss.ss_len;
+		VERIFY(((signed)uaddrlen - ss.ss_len) >= 0);
+		uaddrlen -= ss.ss_len;
+	}
+
+	if (error != 0)
+		sockaddrlist_free(sl);
+	else
+		*slp = sl;
+
+	return (error);
+}
+
+int
+internalize_user_msghdr_array(const void *src, int spacetype, int direction,
+	u_int count, struct user_msghdr_x *dst, struct uio **uiop)
+{
+	int error = 0;
+	u_int i;
+
+	for (i = 0; i < count; i++) {
+		uio_t auio;
+		struct user_iovec *iovp;
+		struct user_msghdr_x *user_msg = &dst[i];
+
+		if (spacetype == UIO_USERSPACE64) {
+			struct user64_msghdr_x *msghdr64;
+
+			msghdr64 = ((struct user64_msghdr_x *)src) + i;
+
+			user_msg->msg_name = msghdr64->msg_name;
+			user_msg->msg_namelen = msghdr64->msg_namelen;
+			user_msg->msg_iov = msghdr64->msg_iov;
+			user_msg->msg_iovlen = msghdr64->msg_iovlen;
+			user_msg->msg_control = msghdr64->msg_control;
+			user_msg->msg_controllen = msghdr64->msg_controllen;
+			user_msg->msg_flags = msghdr64->msg_flags;
+			user_msg->msg_datalen = msghdr64->msg_datalen;
+		} else {
+			struct user32_msghdr_x *msghdr32;
+
+			msghdr32 = ((struct user32_msghdr_x *)src) + i;
+
+			user_msg->msg_name = msghdr32->msg_name;
+			user_msg->msg_namelen = msghdr32->msg_namelen;
+			user_msg->msg_iov = msghdr32->msg_iov;
+			user_msg->msg_iovlen = msghdr32->msg_iovlen;
+			user_msg->msg_control = msghdr32->msg_control;
+			user_msg->msg_controllen = msghdr32->msg_controllen;
+			user_msg->msg_flags = msghdr32->msg_flags;
+			user_msg->msg_datalen = msghdr32->msg_datalen;
+		}
+		
+		if (user_msg->msg_iovlen <= 0 || user_msg->msg_iovlen > UIO_MAXIOV) {
+			error = EMSGSIZE;
+			goto done;
+		}
+		auio = uio_create(user_msg->msg_iovlen, 0, spacetype, direction);
+		if (auio == NULL) {
+			error = ENOMEM;
+			goto done;
+		}
+		uiop[i] = auio;
+
+		if (user_msg->msg_iovlen) {
+			iovp = uio_iovsaddr(auio);
+			if (iovp == NULL) {
+				error = ENOMEM;
+				goto done;
+			}
+			error = copyin_user_iovec_array(user_msg->msg_iov,
+				spacetype, user_msg->msg_iovlen, iovp);
+			 if (error)
+				goto done;
+			user_msg->msg_iov = CAST_USER_ADDR_T(iovp);
+
+			error = uio_calculateresid(auio);
+			if (error)
+				goto done;
+			user_msg->msg_datalen = uio_resid(auio);
+		} else {
+			user_msg->msg_datalen = 0;
+		}
+	}
+done:
+	return (error);
+}
+
+u_int
+externalize_user_msghdr_array(void *dst, int spacetype, int direction,
+	 u_int count, const struct user_msghdr_x *src, struct uio **uiop)
+{
+#pragma unused(direction)
+	u_int i;
+	int seenlast = 0;
+	u_int retcnt = 0;
+
+	for (i = 0; i < count; i++) {
+		const struct user_msghdr_x *user_msg = &src[i];
+		uio_t auio = uiop[i];
+		user_ssize_t len = user_msg->msg_datalen - uio_resid(auio);
+
+		if (user_msg->msg_datalen != 0 && len == 0)
+			seenlast = 1;
+		
+		if (seenlast == 0)
+			retcnt ++;
+
+		if (spacetype == UIO_USERSPACE64) {
+			struct user64_msghdr_x *msghdr64;
+
+			msghdr64 = ((struct user64_msghdr_x *)dst) + i;
+
+			msghdr64->msg_flags = user_msg->msg_flags;
+			msghdr64->msg_datalen = len;
+				
+		} else {
+			struct user32_msghdr_x *msghdr32;
+
+			msghdr32 = ((struct user32_msghdr_x *)dst) + i;
+
+			msghdr32->msg_flags = user_msg->msg_flags;
+			msghdr32->msg_datalen = len;
+		}
+	}
+	return (retcnt);
+}
+
+void
+free_uio_array(struct uio **uiop, u_int count)
+{
+	u_int i;
+
+	for (i = 0; i < count; i++) {
+		if (uiop[i] != NULL)
+			uio_free(uiop[i]);
+	}
+}
+
+__private_extern__ user_ssize_t
+uio_array_resid(struct uio **uiop, u_int count)
+{
+	user_ssize_t len = 0;
+	u_int i;
+
+	for (i = 0; i < count; i++) {
+		struct uio *auio = uiop[i];
+
+		if (auio!= NULL)
+			len += uio_resid(auio);
+	}
+	return (len);
+}
+
+int
+uio_array_is_valid(struct uio **uiop, u_int count)
+{
+	user_ssize_t len = 0;
+	u_int i;
+
+	for (i = 0; i < count; i++) {
+		struct uio *auio = uiop[i];
+		
+		if (auio != NULL) {
+			user_ssize_t resid = uio_resid(auio);
+			
+			/*
+			 * Sanity check on the validity of the iovec:
+			 * no point of going over sb_max
+			 */
+			if (resid < 0 || (u_int32_t)resid > sb_max)
+				return (0);
+				
+			len += resid;
+			if (len < 0 || (u_int32_t)len > sb_max)
+				return (0);
+		}
+	}
+	return (1);
+}
+
 #if SENDFILE
 
-SYSCTL_DECL(_kern_ipc);
-
 #define	SFUIOBUFS 64
-static int sendfileuiobufs = SFUIOBUFS;
-SYSCTL_INT(_kern_ipc, OID_AUTO, sendfileuiobufs, CTLFLAG_RW | CTLFLAG_LOCKED, &sendfileuiobufs,
-    0, "");
 
 /* Macros to compute the number of mbufs needed depending on cluster size */
 #define	HOWMANY_16K(n)	((((unsigned int)(n) - 1) >> (PGSHIFT + 2)) + 1)
 #define	HOWMANY_4K(n)	((((unsigned int)(n) - 1) >> PGSHIFT) + 1)
 
-/* Upper send limit in bytes (sendfileuiobufs * PAGESIZE) */
-#define SENDFILE_MAX_BYTES	(sendfileuiobufs << PGSHIFT)
+/* Upper send limit in bytes (SFUIOBUFS * PAGESIZE) */
+#define SENDFILE_MAX_BYTES	(SFUIOBUFS << PGSHIFT)
 
 /* Upper send limit in the number of mbuf clusters */
 #define	SENDFILE_MAX_16K	HOWMANY_16K(SENDFILE_MAX_BYTES)
 #define	SENDFILE_MAX_4K		HOWMANY_4K(SENDFILE_MAX_BYTES)
-
-size_t mbuf_pkt_maxlen(mbuf_t m);
-
-__private_extern__ size_t
-mbuf_pkt_maxlen(mbuf_t m)
-{
-	size_t maxlen = 0;
-
-	while (m) {
-		maxlen += mbuf_maxlen(m);
-		m = mbuf_next(m);
-	}
-	return (maxlen);
-}
 
 static void
 alloc_sendpkt(int how, size_t pktlen, unsigned int *maxchunks,
@@ -2208,16 +3009,16 @@ sendfile(struct proc *p, struct sendfile_args *uap, __unused int *retval)
 	 * mbufs that point to the file pages.
 	 */
 	socket_lock(so, 1);
-	error = sblock(&so->so_snd, M_WAIT);
+	error = sblock(&so->so_snd, SBL_WAIT);
 	if (error) {
 		socket_unlock(so, 1);
 		goto done2;
 	}
 	for (off = uap->offset; ; off += xfsize, sbytes += xfsize) {
 		mbuf_t	m0 = NULL, m;
-		unsigned int	nbufs = sendfileuiobufs, i;
+		unsigned int	nbufs = SFUIOBUFS, i;
 		uio_t	auio;
-		char	uio_buf[UIO_SIZEOF(sendfileuiobufs)]; /* 1 KB !!! */
+		char	uio_buf[UIO_SIZEOF(SFUIOBUFS)]; /* 1 KB !!! */
 		size_t	uiolen;
 		user_ssize_t	rlen;
 		off_t	pgoff;
@@ -2270,10 +3071,10 @@ sendfile(struct proc *p, struct sendfile_args *uap, __unused int *retval)
 
 		socket_unlock(so, 0);
 		alloc_sendpkt(M_WAIT, xfsize, &nbufs, &m0, jumbocl);
-		pktlen = mbuf_pkt_maxlen(m0);
+		pktlen = mbuf_pkthdr_maxlen(m0);
 		if (pktlen < (size_t)xfsize)
 			xfsize = pktlen;
-		
+
 		auio = uio_createwithbuffer(nbufs, off, UIO_SYSSPACE,
 		    UIO_READ, &uio_buf[0], sizeof (uio_buf));
 		if (auio == NULL) {
@@ -2392,7 +3193,7 @@ retry_space:
 			}
 			goto retry_space;
 		}
-		
+
 		struct mbuf *control = NULL;
 		{
 			/*
@@ -2423,7 +3224,7 @@ retry_space:
 			goto done3;
 		}
 	}
-	sbunlock(&so->so_snd, 0);	/* will unlock socket */
+	sbunlock(&so->so_snd, FALSE);	/* will unlock socket */
 	/*
 	 * Send trailers. Wimp out and use writev(2).
 	 */
@@ -2454,7 +3255,7 @@ done:
 	    (unsigned int)(sbytes & 0x0ffffffff), error, 0);
 	return (error);
 done3:
-	sbunlock(&so->so_snd, 0);	/* will unlock socket */
+	sbunlock(&so->so_snd, FALSE);	/* will unlock socket */
 	goto done2;
 }
 

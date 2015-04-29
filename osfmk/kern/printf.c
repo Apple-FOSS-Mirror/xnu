@@ -156,10 +156,8 @@
 
 #include <debug.h>
 #include <mach_kdp.h>
-#include <platforms.h>
 #include <mach/boolean.h>
 #include <kern/cpu_number.h>
-#include <kern/lock.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
 #include <kern/misc_protos.h>
@@ -844,7 +842,6 @@ kdb_printf_unbuffered(const char *fmt, ...)
 	return 0;
 }
 
-#if !CONFIG_EMBEDDED
 
 static void
 copybyte(int c, void *arg)
@@ -877,4 +874,3 @@ sprintf(char *buf, const char *fmt, ...)
 	*copybyte_str = '\0';
         return (int)strlen(buf);
 }
-#endif /* !CONFIG_EMBEDDED */

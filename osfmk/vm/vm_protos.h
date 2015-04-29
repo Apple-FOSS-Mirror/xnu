@@ -92,6 +92,8 @@ extern vm_map_offset_t get_map_max(vm_map_t);
 extern vm_map_size_t get_vmmap_size(vm_map_t);
 extern int get_vmmap_entries(vm_map_t);
 
+int vm_map_page_mask(vm_map_t);
+
 extern boolean_t coredumpok(vm_map_t map, vm_offset_t va);
 
 /*
@@ -152,6 +154,8 @@ extern void vnode_pager_shutdown(void);
 extern void *upl_get_internal_page_list(
 	upl_t upl);
 
+extern void vnode_setswapmount(struct vnode *);
+
 typedef int pager_return_t;
 extern pager_return_t	vnode_pagein(
 	struct vnode *, upl_t,
@@ -172,20 +176,32 @@ extern boolean_t vnode_pager_isSSD(
 	struct vnode *);
 extern void vnode_pager_throttle(
 	void);
-extern uint32_t vnode_pager_return_hard_throttle_limit(
+extern uint32_t vnode_pager_return_throttle_io_limit(
 	struct vnode *,
-	uint32_t     *,
-	uint32_t);
-extern kern_return_t vnode_pager_get_pathname(
+	uint32_t     *);
+extern kern_return_t vnode_pager_get_name(
 	struct vnode	*vp,
 	char		*pathname,
-	vm_size_t	*length_p);
-extern kern_return_t vnode_pager_get_filename(
+	vm_size_t	pathname_len,
+	char		*filename,
+	vm_size_t	filename_len,
+	boolean_t	*truncated_path_p);
+struct timespec;
+extern kern_return_t vnode_pager_get_mtime(
 	struct vnode	*vp,
-	const char	**filename);
+	struct timespec	*mtime,
+	struct timespec	*cs_mtime);
 extern kern_return_t vnode_pager_get_cs_blobs(
 	struct vnode	*vp,
 	void		**blobs);
+
+#if CONFIG_IOSCHED
+void vnode_pager_issue_reprioritize_io(
+	struct vnode 	*devvp, 
+	uint64_t 	blkno, 
+	uint32_t 	len,
+	int 		priority);
+#endif
 
 #if CHECK_CS_VALIDATION_BITMAP	
 /* used by the vnode_pager_cs_validation_bitmap routine*/
@@ -195,7 +211,7 @@ extern kern_return_t vnode_pager_get_cs_blobs(
 
 #endif /* CHECK_CS_VALIDATION_BITMAP */
 
-extern void vnode_pager_bootstrap(void) __attribute__((section("__TEXT, initcode")));
+extern void vnode_pager_bootstrap(void);
 extern kern_return_t
 vnode_pager_data_unlock(
 	memory_object_t		mem_obj,
@@ -209,23 +225,33 @@ extern kern_return_t vnode_pager_init(
 extern kern_return_t vnode_pager_get_object_size(
 	memory_object_t,
 	memory_object_offset_t *);
+
+#if CONFIG_IOSCHED
+extern kern_return_t vnode_pager_get_object_devvp(
+        memory_object_t,
+        uintptr_t *);
+#endif
+
 extern kern_return_t vnode_pager_get_isinuse(
 	memory_object_t,
 	uint32_t *);
 extern kern_return_t vnode_pager_get_isSSD(
 	memory_object_t,
 	boolean_t *);
-extern kern_return_t vnode_pager_check_hard_throttle(
+extern kern_return_t vnode_pager_get_throttle_io_limit(
 	memory_object_t,
-	uint32_t *,
-	uint32_t);
-extern kern_return_t vnode_pager_get_object_pathname(
+	uint32_t *);
+extern kern_return_t vnode_pager_get_object_name(
 	memory_object_t	mem_obj,
 	char		*pathname,
-	vm_size_t	*length_p);
-extern kern_return_t vnode_pager_get_object_filename(
+	vm_size_t	pathname_len,
+	char		*filename,
+	vm_size_t	filename_len,
+	boolean_t	*truncated_path_p);
+extern kern_return_t vnode_pager_get_object_mtime(
 	memory_object_t	mem_obj,
-	const char	**filename);
+	struct timespec *mtime,
+	struct timespec	*cs_mtime);
 extern kern_return_t vnode_pager_get_object_cs_blobs(
 	memory_object_t	mem_obj,
 	void		**blobs);
@@ -357,7 +383,7 @@ default_freezer_pack(
 	boolean_t		*shared,
 	vm_object_t		src_object,
 	struct default_freezer_handle *df_handle);
-__private_extern__ void
+__private_extern__ kern_return_t
 default_freezer_unpack(
 	struct default_freezer_handle *df_handle);	
 __private_extern__ void
@@ -409,7 +435,13 @@ extern memory_object_t device_pager_setup(
 	uintptr_t,
 	vm_size_t,
 	int);
-extern void device_pager_bootstrap(void) __attribute__((section("__TEXT, initcode")));
+extern void device_pager_bootstrap(void);
+
+extern kern_return_t pager_map_to_phys_contiguous(
+	memory_object_control_t	object,
+	memory_object_offset_t	offset,
+	addr64_t		base_vaddr,
+	vm_size_t		size);
 
 extern kern_return_t memory_object_create_named(
 	memory_object_t	pager,
@@ -429,6 +461,7 @@ extern int macx_swapinfo(
 extern void log_stack_execution_failure(addr64_t vaddr, vm_prot_t prot);
 extern void log_unnest_badness(vm_map_t, vm_map_offset_t, vm_map_offset_t);
 
+struct proc;
 extern int cs_allow_invalid(struct proc *p);
 extern int cs_invalid_page(addr64_t vaddr);
 extern boolean_t cs_validate_page(void *blobs,
@@ -441,6 +474,11 @@ extern kern_return_t mach_memory_entry_purgable_control(
 	ipc_port_t	entry_port,
 	vm_purgable_t	control,
 	int		*state);
+
+extern kern_return_t mach_memory_entry_get_page_counts(
+	ipc_port_t	entry_port,
+	unsigned int	*resident_page_count,
+	unsigned int	*dirty_page_count);
 
 extern kern_return_t mach_memory_entry_page_op(
 	ipc_port_t		entry_port,
@@ -467,12 +505,57 @@ extern void vm_paging_map_init(void);
 extern int macx_backing_store_compaction(int flags);
 extern unsigned int mach_vm_ctl_page_free_wanted(void);
 
-extern void no_paging_space_action(void);
+extern int no_paging_space_action(void);
 
 #define VM_TOGGLE_CLEAR		0
 #define VM_TOGGLE_SET		1
 #define VM_TOGGLE_GETVALUE	999
 int vm_toggle_entry_reuse(int, int*);
+
+#define	SWAP_WRITE		0x00000000	/* Write buffer (pseudo flag). */
+#define	SWAP_READ		0x00000001	/* Read buffer. */
+#define	SWAP_ASYNC		0x00000002	/* Start I/O, do not wait. */
+
+extern void vm_compressor_pager_init(void);
+extern kern_return_t compressor_memory_object_create(
+	memory_object_size_t,
+	memory_object_t *);
+
+#if CONFIG_JETSAM
+extern int proc_get_memstat_priority(struct proc*, boolean_t);
+#endif /* CONFIG_JETSAM */
+
+/* the object purger. purges the next eligible object from memory. */
+/* returns TRUE if an object was purged, otherwise FALSE. */
+boolean_t vm_purgeable_object_purge_one_unlocked(int force_purge_below_group);
+void vm_purgeable_disown(task_t task);
+
+struct trim_list {
+	uint64_t	tl_offset;
+	uint64_t	tl_length;
+	struct trim_list *tl_next;
+};
+
+u_int32_t vnode_trim_list(struct vnode *vp, struct trim_list *tl, boolean_t route_only);
+
+#define MAX_SWAPFILENAME_LEN	1024
+#define SWAPFILENAME_INDEX_LEN	2	/* Doesn't include the terminating NULL character */
+
+extern char	swapfilename[MAX_SWAPFILENAME_LEN + 1];
+
+struct vm_counters {
+	unsigned int	do_collapse_compressor;
+	unsigned int	do_collapse_compressor_pages;
+	unsigned int	do_collapse_terminate;
+	unsigned int	do_collapse_terminate_failure;
+	unsigned int	should_cow_but_wired;
+	unsigned int	create_upl_extra_cow;
+	unsigned int	create_upl_extra_cow_pages;
+	unsigned int	create_upl_lookup_failure_write;
+	unsigned int	create_upl_lookup_failure_copy;
+};
+extern struct vm_counters vm_counters;
+
 #endif	/* _VM_VM_PROTOS_H_ */
 
 #endif	/* XNU_KERNEL_PRIVATE */

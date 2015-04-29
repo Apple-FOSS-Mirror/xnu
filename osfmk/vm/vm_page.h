@@ -67,13 +67,14 @@
 #define _VM_VM_PAGE_H_
 
 #include <debug.h>
+#include <vm/vm_options.h>
 
 #include <mach/boolean.h>
 #include <mach/vm_prot.h>
 #include <mach/vm_param.h>
 #include <vm/vm_object.h>
 #include <kern/queue.h>
-#include <kern/lock.h>
+#include <kern/locks.h>
 
 #include <kern/macro_help.h>
 #include <libkern/OSAtomic.h>
@@ -132,6 +133,8 @@ extern int			speculative_age_index;
 extern unsigned int		vm_page_speculative_q_age_ms;
 
 
+#define	VM_PAGE_COMPRESSOR_COUNT	(compressor_object->resident_page_count)
+
 /*
  *	Management of resident (logical) pages.
  *
@@ -158,16 +161,45 @@ extern unsigned int		vm_page_speculative_q_age_ms;
  *	change that field; holding either lock is sufficient to read.]
  */
 
+
+#if    defined(__LP64__)
+
+/*
+ * in order to make the size of a vm_page_t 64 bytes (cache line size for both arm64 and x86_64)
+ * we'll keep the next_m pointer packed... as long as the kernel virtual space where we allocate
+ * vm_page_t's from doesn't span more then 256 Gbytes, we're safe.   There are live tests in the
+ * vm_page_t array allocation and the zone init code to determine if we can safely pack and unpack
+ * pointers from the 2 ends of these spaces
+ */
+typedef uint32_t	vm_page_packed_t;
+
+#define	VM_PAGE_PACK_PTR(m)	(!(m) ? (vm_page_packed_t)0 : ((vm_page_packed_t)((uintptr_t)(((uintptr_t)(m) - (uintptr_t) VM_MIN_KERNEL_AND_KEXT_ADDRESS)) >> 6)))
+#define	VM_PAGE_UNPACK_PTR(p)	(!(p) ? VM_PAGE_NULL : ((vm_page_t)((((uintptr_t)(p)) << 6) + (uintptr_t) VM_MIN_KERNEL_AND_KEXT_ADDRESS)))
+
+#else
+
+/*
+ * we can't do the packing trick on 32 bit architectures, so 
+ * just turn the macros into noops.
+ */
+typedef struct vm_page	*vm_page_packed_t;
+
+#define	VM_PAGE_PACK_PTR(m)	((vm_page_packed_t)(m))
+#define	VM_PAGE_UNPACK_PTR(p)	((vm_page_t)(p))
+
+#endif
+
+
 struct vm_page {
 	queue_chain_t	pageq;		/* queue info for FIFO */
 					/* queue or free list (P) */
 
 	queue_chain_t	listq;		/* all pages in same object (O) */
-	struct vm_page	*next;		/* VP bucket link (O) */
 
-	vm_object_t	object;		/* which object am I in (O&P) */
 	vm_object_offset_t offset;	/* offset into that object (O,P) */
+	vm_object_t	object;		/* which object am I in (O&P) */
 
+	vm_page_packed_t next_m;	/* VP bucket link (O) */
 	/*
 	 * The following word of flags is protected
 	 * by the "page queues" lock.
@@ -184,7 +216,7 @@ struct vm_page {
 			clean_queue:1,	/* page is in pre-cleaned list (P) */
 		        local:1,	/* page is in one of the local queues (P) */
 			speculative:1,	/* page is in speculative list (P) */
-			throttled:1,	/* pager is not responding (P) */
+			throttled:1,	/* pager is not responding or doesn't exist(P) */
 			free:1,		/* page is on free list (P) */
 			pageout_queue:1,/* page is on queue for pageout (P) */
 			laundry:1,	/* page is being cleaned now (P)*/
@@ -194,6 +226,7 @@ struct vm_page {
 					 *  the free list (P) */
 			no_cache:1,	/* page is not to be cached and should
 					 * be reused ahead of other pages (P) */
+
 			__unused_pageq_bits:3;	/* 3 bits available here */
 
 	ppnum_t		phys_page;	/* Physical address of page, passed
@@ -207,15 +240,21 @@ struct vm_page {
 	/* boolean_t */	busy:1,		/* page is in transit (O) */
 			wanted:1,	/* someone is waiting for page (O) */
 			tabled:1,	/* page is in VP table (O) */
+			hashed:1,	/* page is in vm_page_buckets[]
+					   (O) + the bucket lock */
 			fictitious:1,	/* Physical page doesn't exist (O) */
 	/*
-	 * IMPORTANT: the "pmapped" bit can be turned on while holding the
-	 * VM object "shared" lock.  See vm_fault_enter().
-	 * This is OK as long as it's the only bit in this bit field that
-	 * can be updated without holding the VM object "exclusive" lock.
+	 * IMPORTANT: the "pmapped", "xpmapped" and "clustered" bits can be modified while holding the
+	 * VM object "shared" lock + the page lock provided through the pmap_lock_phys_page function.
+	 * This is done in vm_fault_enter and the CONSUME_CLUSTERED macro.
+	 * It's also ok to modify them behind just the VM object "exclusive" lock.
 	 */
+			clustered:1,	/* page is not the faulted page (O) or (O-shared AND pmap_page) */
 			pmapped:1,     	/* page has been entered at some
-					 * point into a pmap (O **shared**) */
+               				 * point into a pmap (O) or (O-shared AND pmap_page) */
+		        xpmapped:1,	/* page has been entered with execute permission (O)
+					   or (O-shared AND pmap_page) */
+
 			wpmapped:1,     /* page has been entered at some
 					 * point into a pmap for write (O) */
 			pageout:1,	/* page wired & busy for pageout (O) */
@@ -227,7 +266,6 @@ struct vm_page {
 			cleaning:1,	/* Page clean has begun (O) */
 			precious:1,	/* Page is precious; data must be
 					 *  returned even if clean (O) */
-			clustered:1,	/* page is not the faulted page (O) */
 			overwriting:1,  /* Request to unlock has been made
 					 * without having data. (O)
 					 * [See vm_fault_page_overwrite] */
@@ -243,13 +281,9 @@ struct vm_page {
 			reusable:1,
 		        lopage:1,
 			slid:1,
-			was_dirty:1,	/* was this page previously dirty? */
-			__unused_object_bits:8;  /* 8 bits available here */
-
-#if __LP64__
-	unsigned int __unused_padding;	/* Pad structure explicitly
-					* to 8-byte multiple for LP64 */
-#endif
+		        compressor:1,	/* page owned by compressor pool */
+		        written_by_kernel:1,	/* page was written by kernel (i.e. decompressed) */
+			__unused_object_bits:5;  /* 5 bits available here */
 };
 
 #define DEBUG_ENCRYPTED_SWAP	1
@@ -363,6 +397,8 @@ vm_map_size_t	vm_global_no_user_wire_amount;
 
 struct vpl {
 	unsigned int	vpl_count;
+	unsigned int	vpl_internal_count;
+	unsigned int	vpl_external_count;
 	queue_head_t	vpl_queue;
 #ifdef	VPL_LOCK_SPIN
 	lck_spin_t	vpl_lock;
@@ -423,8 +459,18 @@ extern
 unsigned int	vm_page_throttled_count;/* How many inactives are throttled */
 extern
 unsigned int	vm_page_speculative_count;	/* How many speculative pages are unclaimed? */
+extern unsigned int	vm_page_pageable_internal_count;
+extern unsigned int	vm_page_pageable_external_count;
 extern
-unsigned int	vm_page_wire_count;	/* How many pages are wired? */
+unsigned int	vm_page_xpmapped_external_count;	/* How many pages are mapped executable? */
+extern
+unsigned int	vm_page_external_count;	/* How many pages are file-backed? */
+extern
+unsigned int	vm_page_internal_count;	/* How many pages are anonymous? */
+extern
+unsigned int	vm_page_wire_count;		/* How many pages are wired? */
+extern
+unsigned int	vm_page_wire_count_initial;	/* How many pages wired at startup */
 extern
 unsigned int	vm_page_free_target;	/* How many do we want free? */
 extern
@@ -473,6 +519,8 @@ extern ppnum_t	vm_page_guard_addr;
 
 extern boolean_t	vm_page_deactivate_hint;
 
+extern int		vm_compressor_mode;
+
 /*
    0 = all pages avail ( default. )
    1 = disable high mem ( cap max pages to 4G)
@@ -493,9 +541,9 @@ extern ppnum_t		max_valid_low_ppnum;
  */
 extern void		vm_page_bootstrap(
 					vm_offset_t	*startp,
-					vm_offset_t	*endp) __attribute__((section("__TEXT, initcode")));
+					vm_offset_t	*endp);
 
-extern void		vm_page_module_init(void) __attribute__((section("__TEXT, initcode")));
+extern void		vm_page_module_init(void);
 					
 extern void		vm_page_init_local_q(void);
 
@@ -649,51 +697,57 @@ extern void		vm_page_free_prepare_object(
 	                                vm_page_t	page,
 					boolean_t	remove_from_hash);
 
+#if CONFIG_IOSCHED
+extern wait_result_t	vm_page_sleep(
+					vm_object_t	object,
+					vm_page_t	m,
+					int	interruptible);
+#endif
+
+extern void vm_pressure_response(void);
+
 #if CONFIG_JETSAM
-extern void memorystatus_update(unsigned int pages_avail);
+extern void memorystatus_pages_update(unsigned int pages_avail);
 
 #define VM_CHECK_MEMORYSTATUS do { \
-	memorystatus_update(		\
-      		vm_page_active_count + 		\
-      		vm_page_inactive_count + 	\
-      		vm_page_speculative_count + 	\
-      		vm_page_free_count +		\
+	memorystatus_pages_update(		\
+      		vm_page_pageable_external_count + \
+		vm_page_free_count +		\
       		(VM_DYNAMIC_PAGING_ENABLED(memory_manager_default) ? 0 : vm_page_purgeable_count) \
 		); \
 	} while(0)
-#else 
-#define VM_CHECK_MEMORYSTATUS do {} while(0)
-#endif
+
+#else /* CONFIG_JETSAM */
+
+
+#define VM_CHECK_MEMORYSTATUS	vm_pressure_response()
+
+
+#endif /* CONFIG_JETSAM */
 
 /*
  *	Functions implemented as macros. m->wanted and m->busy are
  *	protected by the object lock.
  */
 
-#if CONFIG_EMBEDDED
-#define SET_PAGE_DIRTY(m, set_pmap_modified)				\
-		MACRO_BEGIN						\
-		vm_page_t __page__ = (m);				\
-		if (__page__->dirty == FALSE && (set_pmap_modified)) {	\
-			pmap_set_modify(__page__->phys_page);		\
-		}							\
-		__page__->dirty = TRUE;					\
-		MACRO_END
-#else /* CONFIG_EMBEDDED */
 #define SET_PAGE_DIRTY(m, set_pmap_modified)				\
 		MACRO_BEGIN						\
 		vm_page_t __page__ = (m);				\
 		__page__->dirty = TRUE;					\
 		MACRO_END
-#endif /* CONFIG_EMBEDDED */
 
 #define PAGE_ASSERT_WAIT(m, interruptible)			\
 		(((m)->wanted = TRUE),				\
 		 assert_wait((event_t) (m), (interruptible)))
 
+#if CONFIG_IOSCHED
 #define PAGE_SLEEP(o, m, interruptible)				\
-		(((m)->wanted = TRUE),				\
-		 thread_sleep_vm_object((o), (m), (interruptible)))
+		vm_page_sleep(o, m, interruptible)
+#else
+#define PAGE_SLEEP(o, m, interruptible)				\
+	(((m)->wanted = TRUE),					\
+	 thread_sleep_vm_object((o), (m), (interruptible)))
+#endif
 
 #define PAGE_WAKEUP_DONE(m)					\
 		MACRO_BEGIN					\
@@ -771,8 +825,10 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 
 #define VM_PAGE_QUEUES_REMOVE(mem)				\
 	MACRO_BEGIN						\
+	boolean_t	was_pageable;				\
+								\
 	VM_PAGE_QUEUES_ASSERT(mem, 1);				\
-	assert(!mem->laundry);					\
+	assert(!mem->pageout_queue);				\
 /*								\
  *	if (mem->pageout_queue)					\
  * 		NOTE: VM_PAGE_QUEUES_REMOVE does not deal with removing pages from the pageout queue...	\
@@ -783,6 +839,7 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 	if (mem->local) {					\
 		struct vpl	*lq;				\
 		assert(mem->object != kernel_object);		\
+		assert(mem->object != compressor_object);	\
 		assert(!mem->inactive && !mem->speculative);	\
 		assert(!mem->active && !mem->throttled);	\
 		assert(!mem->clean_queue);			\
@@ -794,11 +851,18 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 		mem->local = FALSE;				\
 		mem->local_id = 0;				\
 		lq->vpl_count--;				\
+		if (mem->object->internal) {			\
+			lq->vpl_internal_count--;		\
+		} else {					\
+			lq->vpl_external_count--;		\
+		}						\
 		VPL_UNLOCK(&lq->vpl_lock);			\
+		was_pageable = FALSE;				\
 	}							\
 								\
 	else if (mem->active) {					\
 		assert(mem->object != kernel_object);		\
+		assert(mem->object != compressor_object);	\
 		assert(!mem->inactive && !mem->speculative);	\
 		assert(!mem->clean_queue);			\
 		assert(!mem->throttled);			\
@@ -807,10 +871,12 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 			mem, vm_page_t, pageq);			\
 		mem->active = FALSE;				\
 		vm_page_active_count--;				\
+		was_pageable = TRUE;				\
 	}							\
 								\
 	else if (mem->inactive) {				\
 		assert(mem->object != kernel_object);		\
+		assert(mem->object != compressor_object);	\
 		assert(!mem->active && !mem->speculative);	\
 		assert(!mem->throttled);			\
 		assert(!mem->fictitious);			\
@@ -832,9 +898,11 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 			vm_purgeable_q_advance_all();		\
 		}						\
 		mem->inactive = FALSE;				\
+		was_pageable = TRUE;				\
 	}							\
 								\
 	else if (mem->throttled) {				\
+		assert(mem->object != compressor_object);	\
 		assert(!mem->active && !mem->inactive);		\
 		assert(!mem->speculative);			\
 		assert(!mem->fictitious);			\
@@ -842,22 +910,37 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 			     mem, vm_page_t, pageq);		\
 		mem->throttled = FALSE;				\
 		vm_page_throttled_count--;			\
+		was_pageable = FALSE;				\
 	}							\
 								\
 	else if (mem->speculative) {				\
+		assert(mem->object != compressor_object);	\
 		assert(!mem->active && !mem->inactive);		\
 		assert(!mem->throttled);			\
 		assert(!mem->fictitious);			\
                 remque(&mem->pageq);				\
 		mem->speculative = FALSE;			\
 		vm_page_speculative_count--;			\
+		was_pageable = TRUE;				\
 	}							\
 								\
-	else if (mem->pageq.next || mem->pageq.prev)		\
+	else if (mem->pageq.next || mem->pageq.prev) {		\
+		was_pageable = FALSE;				\
 		panic("VM_PAGE_QUEUES_REMOVE: unmarked page on Q");	\
+	} else {						\
+		was_pageable = FALSE;				\
+	}							\
+								\
 	mem->pageq.next = NULL;					\
 	mem->pageq.prev = NULL;					\
 	VM_PAGE_QUEUES_ASSERT(mem, 0);				\
+	if (was_pageable) {					\
+		if (mem->object->internal) {			\
+			vm_page_pageable_internal_count--;	\
+		} else {					\
+			vm_page_pageable_external_count--;	\
+		}						\
+	}							\
 	MACRO_END
 
 
@@ -872,12 +955,14 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 			queue_enter_first(&vm_page_queue_anonymous, mem, vm_page_t, pageq);	\
 		else						\
 			queue_enter(&vm_page_queue_anonymous, mem, vm_page_t, pageq);		\
-		vm_page_anonymous_count++;				\
+		vm_page_anonymous_count++;			\
+		vm_page_pageable_internal_count++;		\
 	} else {						\
 		if (first == TRUE)				\
 			queue_enter_first(&vm_page_queue_inactive, mem, vm_page_t, pageq); \
 		else						\
 			queue_enter(&vm_page_queue_inactive, mem, vm_page_t, pageq);	\
+		vm_page_pageable_external_count++;			\
 	}							\
 	mem->inactive = TRUE;					\
 	vm_page_inactive_count++;				\
@@ -897,14 +982,27 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 
 #define VM_PAGE_CONSUME_CLUSTERED(mem)				\
 	MACRO_BEGIN						\
+	pmap_lock_phys_page(mem->phys_page);			\
 	if (mem->clustered) {					\
 	        assert(mem->object);				\
 	        mem->object->pages_used++;			\
 		mem->clustered = FALSE;				\
 		VM_PAGE_SPECULATIVE_USED_ADD();			\
 	}							\
+	pmap_unlock_phys_page(mem->phys_page);			\
 	MACRO_END
 
+
+#define VM_PAGE_COUNT_AS_PAGEIN(mem)				\
+	MACRO_BEGIN						\
+	DTRACE_VM2(pgin, int, 1, (uint64_t *), NULL);		\
+	current_task()->pageins++;				\
+	if (mem->object->internal) {				\
+		DTRACE_VM2(anonpgin, int, 1, (uint64_t *), NULL);	\
+	} else {						\
+		DTRACE_VM2(fspgin, int, 1, (uint64_t *), NULL);	\
+	}							\
+	MACRO_END
 
 	
 #define DW_vm_page_unwire		0x01
@@ -922,6 +1020,7 @@ extern void vm_page_queues_assert(vm_page_t mem, int val);
 #define DW_move_page			0x1000
 #define DW_VM_PAGE_QUEUES_REMOVE	0x2000
 #define DW_enqueue_cleaned      	0x4000
+#define DW_vm_phantom_cache_update	0x8000
 
 struct vm_page_delayed_work {
 	vm_page_t	dw_m;
@@ -959,5 +1058,8 @@ extern unsigned int vm_max_delayed_work_limit;
 
 extern vm_page_t vm_object_page_grab(vm_object_t);
 
+#if VM_PAGE_BUCKETS_CHECK
+extern void vm_page_buckets_check(void);
+#endif /* VM_PAGE_BUCKETS_CHECK */
 
 #endif	/* _VM_VM_PAGE_H_ */

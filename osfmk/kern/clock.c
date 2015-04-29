@@ -33,7 +33,6 @@
 
 #include <mach/mach_types.h>
 
-#include <kern/lock.h>
 #include <kern/spl.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
@@ -232,6 +231,23 @@ clock_get_calendar_microtime(
 	clock_sec_t			*secs,
 	clock_usec_t		*microsecs)
 {
+	clock_get_calendar_absolute_and_microtime(secs, microsecs, NULL);
+}
+
+/*
+ *	clock_get_calendar_absolute_and_microtime:
+ *
+ *	Returns the current calendar value,
+ *	microseconds as the fraction. Also
+ *	returns mach_absolute_time if abstime
+ *	is not NULL.
+ */
+void
+clock_get_calendar_absolute_and_microtime(
+	clock_sec_t			*secs,
+	clock_usec_t		*microsecs,
+	uint64_t    		*abstime)
+{
 	uint64_t		now;
 	spl_t			s;
 
@@ -239,6 +255,8 @@ clock_get_calendar_microtime(
 	clock_lock();
 
 	now = mach_absolute_time();
+	if (abstime)
+		*abstime = now;
 
 	if (clock_calend.adjdelta < 0) {
 		uint32_t	t32;
@@ -390,9 +408,11 @@ clock_set_calendar_microtime(
 	clock_sec_t			sys;
 	clock_usec_t		microsys;
 	clock_sec_t			newsecs;
+    clock_usec_t        newmicrosecs;
 	spl_t				s;
 
-	newsecs = (microsecs < 500*USEC_PER_SEC)? secs: secs + 1;
+    newsecs = secs;
+    newmicrosecs = microsecs;
 
 	s = splclock();
 	clock_lock();
@@ -428,7 +448,7 @@ clock_set_calendar_microtime(
 	/*
 	 *	Set the new value for the platform clock.
 	 */
-	PESetGMTTimeOfDay(newsecs);
+	PESetUTCTimeOfDay(newsecs, newmicrosecs);
 
 	splx(s);
 
@@ -454,9 +474,11 @@ clock_set_calendar_microtime(
 void
 clock_initialize_calendar(void)
 {
-	clock_sec_t			sys, secs = PEGetGMTTimeOfDay();
-	clock_usec_t 		microsys, microsecs = 0;
+	clock_sec_t			sys, secs;
+	clock_usec_t 		microsys, microsecs;
 	spl_t				s;
+
+    PEGetUTCTimeOfDay(&secs, &microsecs);
 
 	s = splclock();
 	clock_lock();
@@ -547,7 +569,7 @@ clock_adjtime(
 	interval = calend_set_adjustment(secs, microsecs);
 	if (interval != 0) {
 		calend_adjdeadline = mach_absolute_time() + interval;
-		if (!timer_call_enter(&calend_adjcall, calend_adjdeadline, TIMER_CALL_CRITICAL))
+		if (!timer_call_enter(&calend_adjcall, calend_adjdeadline, TIMER_CALL_SYS_CRITICAL))
 			calend_adjactive++;
 	}
 	else
@@ -570,7 +592,7 @@ calend_set_adjustment(
 	/* 
 	 * Compute the total adjustment time in nanoseconds.
 	 */
-	total = (int64_t)*secs * NSEC_PER_SEC + *microsecs * NSEC_PER_USEC;
+	total = ((int64_t)*secs * (int64_t)NSEC_PER_SEC) + (*microsecs * (int64_t)NSEC_PER_USEC);
 
 	/* 
 	 * Disable commpage gettimeofday().
@@ -601,7 +623,7 @@ calend_set_adjustment(
 			 * Positive adjustment. If greater than the preset 'big' 
 			 * threshold, slew at a faster rate, capping if necessary.
 			 */
-			if (total > calend_adjbig)
+			if (total > (int64_t) calend_adjbig)
 				delta *= 10;
 			if (delta > total)
 				delta = (int32_t)total;
@@ -618,7 +640,7 @@ calend_set_adjustment(
 			 * greater than the preset 'big' threshold, slew at a faster 
 			 * rate, capping if necessary.
 			 */
-			if (total < -calend_adjbig)
+			if (total < (int64_t) -calend_adjbig)
 				delta *= 10;
 			delta = -delta;
 			if (delta < total)
@@ -665,8 +687,8 @@ calend_set_adjustment(
 	 * remaining uncorrected time from it. 
 	 */
 	if (ototal != 0) {
-		*secs = (long)(ototal / NSEC_PER_SEC);
-		*microsecs = (int)((ototal % NSEC_PER_SEC) / NSEC_PER_USEC);
+		*secs = (long)(ototal / (long)NSEC_PER_SEC);
+		*microsecs = (int)((ototal % (int)NSEC_PER_SEC) / (int)NSEC_PER_USEC);
 	}
 	else
 		*secs = *microsecs = 0;
@@ -692,7 +714,7 @@ calend_adjust_call(void)
 		if (interval != 0) {
 			clock_deadline_for_periodic_event(interval, mach_absolute_time(), &calend_adjdeadline);
 
-			if (!timer_call_enter(&calend_adjcall, calend_adjdeadline, TIMER_CALL_CRITICAL))
+			if (!timer_call_enter(&calend_adjcall, calend_adjdeadline, TIMER_CALL_SYS_CRITICAL))
 				calend_adjactive++;
 		}
 	}
@@ -792,7 +814,8 @@ mach_wait_until_trap(
 	uint64_t		deadline = args->deadline;
 	wait_result_t	wresult;
 
-	wresult = assert_wait_deadline((event_t)mach_wait_until_trap, THREAD_ABORTSAFE, deadline);
+	wresult = assert_wait_deadline_with_leeway((event_t)mach_wait_until_trap, THREAD_ABORTSAFE,
+						   TIMEOUT_URGENCY_USER_NORMAL, deadline, 0);
 	if (wresult == THREAD_WAITING)
 		wresult = thread_block(mach_wait_until_continue);
 
@@ -827,7 +850,7 @@ _clock_delay_until_deadline(
 	if (	ml_delay_should_spin(interval)	||
 			get_preemption_level() != 0				||
 			ml_get_interrupts_enabled() == FALSE	) {
-		machine_delay_until(deadline);
+		machine_delay_until(interval, deadline);
 	} else {
 		assert_wait_deadline((event_t)clock_delay_until, THREAD_UNINT, deadline);
 
@@ -1003,3 +1026,4 @@ clock_track_calend_nowait(void)
 }
 
 #endif	/* CONFIG_DTRACE */
+

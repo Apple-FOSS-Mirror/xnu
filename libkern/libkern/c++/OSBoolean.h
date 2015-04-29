@@ -63,6 +63,7 @@ class OSString;
 class OSBoolean : public OSObject
 {
     OSDeclareDefaultStructors(OSBoolean)
+    friend class OSSerialize;
 
 protected:
     bool value;
@@ -237,34 +238,34 @@ public:
 };
 
 /*!
- * @const kOSBoolean<code>true</code>
+ * @const kOSBooleanTrue
  *
  * @abstract
  * The OSBoolean constant for <code>true</code>.
  *
  * @discussion
- * The OSBoolean constant for <code>true</code>.
+ * kOSBooleanTrue is the OSBoolean constant for <code>true</code>.
  * This object does not need to be retained or released (but it can be).
  * Comparisons of the form
- * booleanObject == kOSBooleanTrue</code> are acceptable
- * and are equivalent to 
+ * <code>booleanObject == kOSBooleanTrue</code>
+ * are acceptable and are equivalent to 
  * <code>booleanObject->getValue() == true</code>.
  */
 extern OSBoolean * const & kOSBooleanTrue;
 
 /*!
- * @const kOSBoolean<code>false</code>
+ * @const kOSBooleanFalse
  *
  * @abstract
  * The OSBoolean constant for <code>false</code>.
  *
  * @discussion
- * The OSBoolean constant for <code>false</code>.
+ * kOSBooleanFalse is the OSBoolean constant for <code>false</code>.
  * This object does not need to be retained or released (but it can be).
  * Comparisons of the form
  * <code>booleanObject == kOSBooleanFalse</code>
  * are acceptable and are equivalent to
- * <code>booleanObject->getValue() == <code>false</code>.
+ * <code>booleanObject->getValue() == false</code>.
  */
 extern OSBoolean * const & kOSBooleanFalse;
 

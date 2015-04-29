@@ -101,6 +101,7 @@
 
 #include <sys/syscall.h>
 #include <sys/kdebug.h>
+#include <sys/bsdtask_info.h>
 
 #include <security/audit/audit.h>
 #include <bsm/audit_kevents.h>
@@ -120,15 +121,14 @@
 #include <kern/cpu_number.h>
 #include <kern/host.h>
 #include <kern/task.h>
+#include <kern/page_decrypt.h>
+
+#include <IOKit/IOReturn.h>
 
 #include <vm/vm_map.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_pager.h>
 #include <vm/vm_protos.h>
-
-/* XXX the following function should probably be static */
-kern_return_t map_fd_funneled(int, vm_object_offset_t, vm_offset_t *,
-				boolean_t, vm_size_t);
 
 /*
  * XXX Internally, we use VM_PROT_* somewhat interchangeably, but the correct
@@ -164,6 +164,7 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	int fd = uap->fd;
 	int num_retries = 0;
 
+	user_map = current_map();
 	user_addr = (vm_map_offset_t)uap->addr;
 	user_size = (vm_map_size_t) uap->len;
 
@@ -202,13 +203,14 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	 * Align the file position to a page boundary,
 	 * and save its page offset component.
 	 */
-	pageoff = (file_pos & PAGE_MASK);
+	pageoff = (file_pos & vm_map_page_mask(user_map));
 	file_pos -= (vm_object_offset_t)pageoff;
 
 
 	/* Adjust size for rounding (on both ends). */
-	user_size += pageoff;			/* low end... */
-	user_size = mach_vm_round_page(user_size);	/* hi end */
+	user_size += pageoff;	/* low end... */
+	user_size = vm_map_round_page(user_size,	
+				      vm_map_page_mask(user_map)); /* hi end */
 
 	if ((flags & MAP_JIT) && ((flags & MAP_FIXED) || (flags & MAP_SHARED) || !(flags & MAP_ANON))){
 		return EINVAL;
@@ -224,7 +226,7 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 		 * should be aligned after adjustment by pageoff.
 		 */
 		user_addr -= pageoff;
-		if (user_addr & PAGE_MASK)
+		if (user_addr & vm_map_page_mask(user_map))
 			return (EINVAL);
 	}
 #ifdef notyet
@@ -237,8 +239,10 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	 * There should really be a pmap call to determine a reasonable
 	 * location.
 	 */
-	else if (addr < mach_vm_round_page(p->p_vmspace->vm_daddr + MAXDSIZ))
-		addr = mach_vm_round_page(p->p_vmspace->vm_daddr + MAXDSIZ);
+	else if (addr < vm_map_round_page(p->p_vmspace->vm_daddr + MAXDSIZ,
+					  vm_map_page_mask(user_map)))
+		addr = vm_map_round_page(p->p_vmspace->vm_daddr + MAXDSIZ,
+					 vm_map_page_mask(user_map));
 
 #endif
 
@@ -292,7 +296,8 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 		if (err)
 			return(err);
 		fpref = 1;
-		if(fp->f_fglob->fg_type == DTYPE_PSXSHM) {
+		switch (FILEGLOB_DTYPE(fp->f_fglob)) {
+		case DTYPE_PSXSHM:
 			uap->addr = (user_addr_t)user_addr;
 			uap->len = (user_size_t)user_size;
 			uap->prot = prot;
@@ -300,9 +305,9 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 			uap->pos = file_pos;
 			error = pshm_mmap(p, uap, retval, fp, (off_t)pageoff);
 			goto bad;
-		}
-
-		if (fp->f_fglob->fg_type != DTYPE_VNODE) {
+		case DTYPE_VNODE:
+			break;
+		default:
 			error = EINVAL;
 			goto bad;
 		}
@@ -431,22 +436,23 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	 *	We bend a little - round the start and end addresses
 	 *	to the nearest page boundary.
 	 */
-	user_size = mach_vm_round_page(user_size);
+	user_size = vm_map_round_page(user_size,
+				      vm_map_page_mask(user_map));
 
-	if (file_pos & PAGE_MASK_64) {
+	if (file_pos & vm_map_page_mask(user_map)) {
 		if (!mapanon)
 			(void)vnode_put(vp);
 		error = EINVAL;
 		goto bad;
 	}
 
-	user_map = current_map();
-
 	if ((flags & MAP_FIXED) == 0) {
 		alloc_flags |= VM_FLAGS_ANYWHERE;
-		user_addr = mach_vm_round_page(user_addr);
+		user_addr = vm_map_round_page(user_addr,
+					      vm_map_page_mask(user_map));
 	} else {
-		if (user_addr != mach_vm_trunc_page(user_addr)) {
+		if (user_addr != vm_map_trunc_page(user_addr,
+						   vm_map_page_mask(user_map))) {
 		        if (!mapanon)
 			        (void)vnode_put(vp);
 			error = EINVAL;
@@ -509,7 +515,7 @@ map_anon_retry:
 		 * lack of space between the address and the map's maximum.
 		 */
 		if ((result == KERN_NO_SPACE) && ((flags & MAP_FIXED) == 0) && user_addr && (num_retries++ == 0)) {
-			user_addr = PAGE_SIZE;
+			user_addr = vm_map_page_size(user_map);
 			goto map_anon_retry;
 		}
 	} else {
@@ -578,7 +584,7 @@ map_file_retry:
 		 * lack of space between the address and the map's maximum.
 		 */
 		if ((result == KERN_NO_SPACE) && ((flags & MAP_FIXED) == 0) && user_addr && (num_retries++ == 0)) {
-			user_addr = PAGE_SIZE;
+			user_addr = vm_map_page_size(user_map);
 			goto map_file_retry;
 		}
 	}
@@ -638,10 +644,11 @@ msync_nocancel(__unused proc_t p, struct msync_nocancel_args *uap, __unused int3
 	int rv;
 	vm_sync_t sync_flags=0;
 
+	user_map = current_map();
 	addr = (mach_vm_offset_t) uap->addr;
 	size = (mach_vm_size_t)uap->len;
 	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_SC_EXTENDED_INFO, SYS_msync) | DBG_FUNC_NONE), (uint32_t)(addr >> 32), (uint32_t)(size >> 32), 0, 0, 0);
-	if (addr & PAGE_MASK_64) {
+	if (addr & vm_map_page_mask(user_map)) {
 		/* UNIX SPEC: user address is not page-aligned, return EINVAL */
 		return EINVAL;
 	}
@@ -677,7 +684,6 @@ msync_nocancel(__unused proc_t p, struct msync_nocancel_args *uap, __unused int3
 
 	sync_flags |= VM_SYNC_CONTIGUOUS;	/* complain if holes */
 
-	user_map = current_map();
 	rv = mach_vm_msync(user_map, addr, size, sync_flags);
 
 	switch (rv) {
@@ -698,16 +704,18 @@ int
 munmap(__unused proc_t p, struct munmap_args *uap, __unused int32_t *retval)
 {
 	mach_vm_offset_t	user_addr;
-	mach_vm_size_t	user_size;
-	kern_return_t	result;
+	mach_vm_size_t		user_size;
+	kern_return_t		result;
+	vm_map_t		user_map;
 
+	user_map = current_map();
 	user_addr = (mach_vm_offset_t) uap->addr;
 	user_size = (mach_vm_size_t) uap->len;
 
 	AUDIT_ARG(addr, user_addr);
 	AUDIT_ARG(len, user_size);
 
-	if (user_addr & PAGE_MASK_64) {
+	if (user_addr & vm_map_page_mask(user_map)) {
 		/* UNIX SPEC: user address is not page-aligned, return EINVAL */
 		return EINVAL;
 	}
@@ -720,7 +728,7 @@ munmap(__unused proc_t p, struct munmap_args *uap, __unused int32_t *retval)
 		return EINVAL;
 	}
 
-	result = mach_vm_deallocate(current_map(), user_addr, user_size);
+	result = mach_vm_deallocate(user_map, user_addr, user_size);
 	if (result != KERN_SUCCESS) {
 		return(EINVAL);
 	}
@@ -743,11 +751,12 @@ mprotect(__unused proc_t p, struct mprotect_args *uap, __unused int32_t *retval)
 	AUDIT_ARG(len, uap->len);
 	AUDIT_ARG(value32, uap->prot);
 
+	user_map = current_map();
 	user_addr = (mach_vm_offset_t) uap->addr;
 	user_size = (mach_vm_size_t) uap->len;
 	prot = (vm_prot_t)(uap->prot & (VM_PROT_ALL | VM_PROT_TRUSTED));
 
-	if (user_addr & PAGE_MASK_64) {
+	if (user_addr & vm_map_page_mask(user_map)) {
 		/* UNIX SPEC: user address is not page-aligned, return EINVAL */
 		return EINVAL;
 	}
@@ -764,8 +773,6 @@ mprotect(__unused proc_t p, struct mprotect_args *uap, __unused int32_t *retval)
 	if (prot & (VM_PROT_EXECUTE | VM_PROT_WRITE))
 		prot |= VM_PROT_READ;
 #endif	/* 3936456 */
-
-	user_map = current_map();
 
 #if CONFIG_MACF
 	/*
@@ -793,9 +800,12 @@ mprotect(__unused proc_t p, struct mprotect_args *uap, __unused int32_t *retval)
 		 * mac_proc_check_mprotect() hook above. Otherwise, Codesigning will be
 		 * compromised because the check would always succeed and thusly any
 		 * process could sign dynamically. */
-		result = vm_map_sign(user_map, 
-				     vm_map_trunc_page(user_addr), 
-				     vm_map_round_page(user_addr+user_size));
+		result = vm_map_sign(
+			user_map, 
+			vm_map_trunc_page(user_addr,
+					  vm_map_page_mask(user_map)),
+			vm_map_round_page(user_addr+user_size,
+					  vm_map_page_mask(user_map)));
 		switch (result) {
 			case KERN_SUCCESS:
 				break;
@@ -942,8 +952,10 @@ mincore(__unused proc_t p, struct mincore_args *uap, __unused int32_t *retval)
 	 * Make sure that the addresses presented are valid for user
 	 * mode.
 	 */
-	first_addr = addr = mach_vm_trunc_page(uap->addr);
-	end = addr + mach_vm_round_page(uap->len);
+	first_addr = addr = vm_map_trunc_page(uap->addr,
+					      vm_map_page_mask(map));
+	end = addr + vm_map_round_page(uap->len,
+				       vm_map_page_mask(map));
 
 	if (end < addr)
 		return (EINVAL);
@@ -1042,10 +1054,10 @@ mlock(__unused proc_t p, struct mlock_args *uap, __unused int32_t *retvalval)
 	if (size == 0)
 		return (0);
 
-	pageoff = (addr & PAGE_MASK);
-	addr -= pageoff;
-	size = vm_map_round_page(size+pageoff);
 	user_map = current_map();
+	pageoff = (addr & vm_map_page_mask(user_map));
+	addr -= pageoff;
+	size = vm_map_round_page(size+pageoff, vm_map_page_mask(user_map));
 
 	/* have to call vm_map_wire directly to pass "I don't know" protections */
 	result = vm_map_wire(user_map, addr, addr+size, VM_PROT_NONE, TRUE);
@@ -1091,206 +1103,119 @@ munlockall(__unused proc_t p, __unused struct munlockall_args *uap, __unused int
 	return(ENOSYS);
 }
 
-#if		!defined(CONFIG_EMBEDDED)
-/* USV: No! need to obsolete map_fd()! mmap() already supports 64 bits */
-kern_return_t
-map_fd(struct map_fd_args *args)
+#if CONFIG_CODE_DECRYPTION
+int
+mremap_encrypted(__unused struct proc *p, struct mremap_encrypted_args *uap, __unused int32_t *retval)
 {
-	int		fd = args->fd;
-	vm_offset_t	offset = args->offset;
-	vm_offset_t	*va = args->va;
-	boolean_t	findspace = args->findspace;
-	vm_size_t	size = args->size;
-	kern_return_t ret;
+    mach_vm_offset_t	user_addr;
+    mach_vm_size_t	user_size;
+    kern_return_t	result;
+    vm_map_t	user_map;
+    uint32_t	cryptid;
+    cpu_type_t	cputype;
+    cpu_subtype_t	cpusubtype;
+    pager_crypt_info_t crypt_info;
+    const char * cryptname = 0;
+    char *vpath;
+    int len, ret;
+    struct proc_regioninfo_internal pinfo;
+    vnode_t vp;
+    uintptr_t vnodeaddr;
+    uint32_t vid;
+    
+    AUDIT_ARG(addr, uap->addr);
+    AUDIT_ARG(len, uap->len);
+    
+    user_map = current_map();
+    user_addr = (mach_vm_offset_t) uap->addr;
+    user_size = (mach_vm_size_t) uap->len;
+    
+    cryptid = uap->cryptid;
+    cputype = uap->cputype;
+    cpusubtype = uap->cpusubtype;
+    
+    if (user_addr & vm_map_page_mask(user_map)) {
+        /* UNIX SPEC: user address is not page-aligned, return EINVAL */
+        return EINVAL;
+    }
+    
+    switch(cryptid) {
+        case 0:
+            /* not encrypted, just an empty load command */
+            return 0;
+        case 1:
+            cryptname="com.apple.unfree";
+            break;
+        case 0x10:
+            /* some random cryptid that you could manually put into
+             * your binary if you want NULL */
+            cryptname="com.apple.null";
+            break;
+        default:
+            return EINVAL;
+    }
+    
+    if (NULL == text_crypter_create) return ENOTSUP;
+    
+    ret = fill_procregioninfo_onlymappedvnodes( proc_task(p), user_addr, &pinfo, &vnodeaddr, &vid);
+    if (ret == 0 || !vnodeaddr) {
+        /* No really, this returns 0 if the memory address is not backed by a file */
+        return (EINVAL);
+    }
+    
+    vp = (vnode_t)vnodeaddr;
+    if ((vnode_getwithvid(vp, vid)) == 0) {
+        MALLOC_ZONE(vpath, char *, MAXPATHLEN, M_NAMEI, M_WAITOK);
+        if(vpath == NULL) {
+            vnode_put(vp);
+            return (ENOMEM);
+        }
+        
+        len = MAXPATHLEN;
+        ret = vn_getpath(vp, vpath, &len);
+        if(ret) {
+            FREE_ZONE(vpath, MAXPATHLEN, M_NAMEI);
+            vnode_put(vp);
+            return (ret);
+        }
+        
+        vnode_put(vp);
+    } else {
+        return (EINVAL);
+    }
 
-	AUDIT_MACH_SYSCALL_ENTER(AUE_MAPFD);
-	AUDIT_ARG(addr, CAST_DOWN(user_addr_t, args->va));
-	AUDIT_ARG(fd, fd);
-
-	ret = map_fd_funneled( fd, (vm_object_offset_t)offset, va, findspace, size);
-
-	AUDIT_MACH_SYSCALL_EXIT(ret);
-	return ret;
+#if 0
+    kprintf("%s vpath %s cryptid 0x%08x cputype 0x%08x cpusubtype 0x%08x range 0x%016llx size 0x%016llx\n",
+            __FUNCTION__, vpath, cryptid, cputype, cpusubtype, (uint64_t)user_addr, (uint64_t)user_size);
+#endif
+    
+    /* set up decrypter first */
+    crypt_file_data_t crypt_data = {
+        .filename = vpath,
+        .cputype = cputype,
+        .cpusubtype = cpusubtype };
+    result = text_crypter_create(&crypt_info, cryptname, (void*)&crypt_data);
+    FREE_ZONE(vpath, MAXPATHLEN, M_NAMEI);
+    
+    if(result) {
+        printf("%s: unable to create decrypter %s, kr=%d\n",
+               __FUNCTION__, cryptname, result);
+        if (result == kIOReturnNotPrivileged) {
+            /* text encryption returned decryption failure */
+            return (EPERM);
+        } else {
+            return (ENOMEM);
+        }
+    }
+    
+    /* now remap using the decrypter */
+    result = vm_map_apple_protected(user_map, user_addr, user_addr+user_size, &crypt_info);
+    if (result) {
+        printf("%s: mapping failed with %d\n", __FUNCTION__, result);
+        crypt_info.crypt_end(crypt_info.crypt_ops);
+        return (EPERM);
+    }
+    
+    return 0;
 }
-
-kern_return_t
-map_fd_funneled(
-	int			fd,
-	vm_object_offset_t	offset,
-	vm_offset_t		*va,
-	boolean_t		findspace,
-	vm_size_t		size)
-{
-	kern_return_t	result;
-	struct fileproc	*fp;
-	struct vnode	*vp;
-	void *	pager;
-	vm_offset_t	map_addr=0;
-	vm_size_t	map_size;
-	int		err=0;
-	vm_prot_t	maxprot = VM_PROT_ALL;
-	vm_map_t	my_map;
-	proc_t		p = current_proc();
-	struct vnode_attr vattr;
-
-	/*
-	 *	Find the inode; verify that it's a regular file.
-	 */
-
-	err = fp_lookup(p, fd, &fp, 0);
-	if (err)
-		return(err);
-	
-	if (fp->f_fglob->fg_type != DTYPE_VNODE){
-		err = KERN_INVALID_ARGUMENT;
-		goto bad;
-	}
-
-	if (!(fp->f_fglob->fg_flag & FREAD)) {
-		err = KERN_PROTECTION_FAILURE;
-		goto bad;
-	}
-
-	vp = (struct vnode *)fp->f_fglob->fg_data;
-	err = vnode_getwithref(vp);
-	if(err != 0) 
-		goto bad;
-
-	if (vp->v_type != VREG) {
-		(void)vnode_put(vp);
-		err = KERN_INVALID_ARGUMENT;
-		goto bad;
-	}
-
-#if CONFIG_MACF
-	err = mac_file_check_mmap(vfs_context_ucred(vfs_context_current()),
-			fp->f_fglob, VM_PROT_DEFAULT, MAP_FILE, &maxprot);
-	if (err) {
-		(void)vnode_put(vp);
-		goto bad;
-	}
-#endif /* MAC */
-
-#if CONFIG_PROTECT
-	/* check for content protection access */
-	{
-		err = cp_handle_vnop(vp, CP_READ_ACCESS | CP_WRITE_ACCESS, 0);
-	 	if (err != 0) { 
- 			(void) vnode_put(vp);
- 			goto bad;
- 		}
-	}
-#endif /* CONFIG_PROTECT */
-
-	AUDIT_ARG(vnpath, vp, ARG_VNODE1);
-
-	/*
-	 * POSIX: mmap needs to update access time for mapped files
-	 */
-	if ((vnode_vfsvisflags(vp) & MNT_NOATIME) == 0) {
-		VATTR_INIT(&vattr);
-		nanotime(&vattr.va_access_time);
-		VATTR_SET_ACTIVE(&vattr, va_access_time);
-		vnode_setattr(vp, &vattr, vfs_context_current());
-	}
-	
-	if (offset & PAGE_MASK_64) {
-		printf("map_fd: file offset not page aligned(%d : %s)\n",p->p_pid, p->p_comm);
-		(void)vnode_put(vp);
-		err = KERN_INVALID_ARGUMENT;
-		goto bad;
-	}
-	map_size = round_page(size);
-
-	/*
-	 * Allow user to map in a zero length file.
-	 */
-	if (size == 0) {
-		(void)vnode_put(vp);
-		err = KERN_SUCCESS;
-		goto bad;
-	}
-	/*
-	 *	Map in the file.
-	 */
-	pager = (void *)ubc_getpager(vp);
-	if (pager == NULL) {
-		(void)vnode_put(vp);
-		err = KERN_FAILURE;
-		goto bad;
-	}
-
-
-	my_map = current_map();
-
-	result = vm_map_64(
-			my_map,
-			&map_addr, map_size, (vm_offset_t)0, 
-			VM_FLAGS_ANYWHERE, pager, offset, TRUE,
-			VM_PROT_DEFAULT, maxprot,
-			VM_INHERIT_DEFAULT);
-	if (result != KERN_SUCCESS) {
-		(void)vnode_put(vp);
-		err = result;
-		goto bad;
-	}
-
-
-	if (!findspace) {
-		//K64todo fix for 64bit user?
-		uint32_t	dst_addr;
-		vm_map_copy_t	tmp;
-
-		if (copyin(CAST_USER_ADDR_T(va), &dst_addr, sizeof (dst_addr))	||
-					trunc_page(dst_addr) != dst_addr) {
-			(void) vm_map_remove(
-					my_map,
-					map_addr, map_addr + map_size,
-					VM_MAP_NO_FLAGS);
-			(void)vnode_put(vp);
-			err = KERN_INVALID_ADDRESS;
-			goto bad;
-		}
-
-		result = vm_map_copyin(my_map, (vm_map_address_t)map_addr,
-				       (vm_map_size_t)map_size, TRUE, &tmp);
-		if (result != KERN_SUCCESS) {
-			
-			(void) vm_map_remove(my_map, vm_map_trunc_page(map_addr),
-					vm_map_round_page(map_addr + map_size),
-					VM_MAP_NO_FLAGS);
-			(void)vnode_put(vp);
-			err = result;
-			goto bad;
-		}
-
-		result = vm_map_copy_overwrite(my_map,
-					(vm_map_address_t)dst_addr, tmp, FALSE);
-		if (result != KERN_SUCCESS) {
-			vm_map_copy_discard(tmp);
-			(void)vnode_put(vp);
-			err = result;
-			goto bad;
-		}
-	} else {
-		// K64todo bug compatible now, should fix for 64bit user
-		uint32_t user_map_addr = CAST_DOWN_EXPLICIT(uint32_t, map_addr);
-		if (copyout(&user_map_addr, CAST_USER_ADDR_T(va), sizeof (user_map_addr))) {
-			(void) vm_map_remove(my_map, vm_map_trunc_page(map_addr),
-					vm_map_round_page(map_addr + map_size),
-					VM_MAP_NO_FLAGS);
-			(void)vnode_put(vp);
-			err = KERN_INVALID_ADDRESS;
-			goto bad;
-		}
-	}
-
-	ubc_setthreadcred(vp, current_proc(), current_thread());
-	(void)vnode_put(vp);
-	err = 0;
-bad:
-	fp_drop(p, fd, fp, 0);
-	return (err);
-}
-#endif		/* !defined(CONFIG_EMBEDDED) */
-
+#endif /* CONFIG_CODE_DECRYPTION */

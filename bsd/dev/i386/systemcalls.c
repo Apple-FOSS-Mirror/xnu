@@ -66,20 +66,8 @@ extern void unix_syscall(x86_saved_state_t *);
 extern void unix_syscall64(x86_saved_state_t *);
 extern void *find_user_regs(thread_t);
 
-extern void x86_toggle_sysenter_arg_store(thread_t thread, boolean_t valid);
-extern boolean_t x86_sysenter_arg_store_isvalid(thread_t thread);
-
 /* dynamically generated at build time based on syscalls.master */
 extern const char *syscallnames[];
-
-/*
- * This needs to be a single switch so that it's "all on" or "all off",
- * rather than being turned on for some code paths and not others, as this
- * has a tendency to introduce "blame the next guy" bugs.
- */
-#if DEBUG
-#define	FUNNEL_DEBUG	1	/* Check for funnel held on exit */
-#endif
 
 /*
  * Function:	unix_syscall
@@ -101,7 +89,6 @@ unix_syscall(x86_saved_state_t *state)
 	struct proc		*p;
 	struct uthread		*uthread;
 	x86_saved_state32_t	*regs;
-	boolean_t		args_in_uthread;
 	boolean_t		is_vfork;
 
 	assert(is_saved_state32(state));
@@ -132,7 +119,6 @@ unix_syscall(x86_saved_state_t *state)
 	code = regs->eax & I386_SYSCALL_NUMBER_MASK;
 	DEBUG_KPRINT_SYSCALL_UNIX("unix_syscall: code=%d(%s) eip=%u\n",
 							  code, syscallnames[code >= NUM_SYSENT ? 63 : code], (uint32_t)regs->eip);
-	args_in_uthread = ((regs->eax & I386_SYSCALL_ARG_BYTES_MASK) != 0) && x86_sysenter_arg_store_isvalid(thread);
 	params = (vm_offset_t) (regs->uesp + sizeof (int));
 
 	regs->efl &= ~(EFL_CF);
@@ -148,20 +134,21 @@ unix_syscall(x86_saved_state_t *state)
 	vt = (void *)uthread->uu_arg;
 
 	if (callp->sy_arg_bytes != 0) {
+#if CONFIG_REQUIRES_U32_MUNGING
 		sy_munge_t	*mungerp;
+#else
+#error U32 syscalls on x86_64 kernel requires munging
+#endif
+		uint32_t	 nargs;
 
 		assert((unsigned) callp->sy_arg_bytes <= sizeof (uthread->uu_arg));
-		if (!args_in_uthread)
-		{
-			uint32_t nargs;
-			nargs = callp->sy_arg_bytes;
-			error = copyin((user_addr_t) params, (char *) vt, nargs);
-			if (error) {
-				regs->eax = error;
-				regs->efl |= EFL_CF;
-				thread_exception_return();
-				/* NOTREACHED */
-			}
+		nargs = callp->sy_arg_bytes;
+		error = copyin((user_addr_t) params, (char *) vt, nargs);
+		if (error) {
+			regs->eax = error;
+			regs->efl |= EFL_CF;
+			thread_exception_return();
+			/* NOTREACHED */
 		}
 
 		if (__probable(code != 180)) {
@@ -171,17 +158,13 @@ unix_syscall(x86_saved_state_t *state)
 				BSDDBG_CODE(DBG_BSD_EXCP_SC, code) | DBG_FUNC_START,
 				*ip, *(ip+1), *(ip+2), *(ip+3), 0);
 		}
+
+#if CONFIG_REQUIRES_U32_MUNGING
 		mungerp = callp->sy_arg_munge32;
 
-		/*
-		 * If non-NULL, then call the syscall argument munger to
-		 * copy in arguments (see xnu/bsd/dev/{i386|x86_64}/munge.s); the
-		 * first argument is NULL because we are munging in place
-		 * after a copyin because the ABI currently doesn't use
-		 * registers to pass system call arguments.
-		 */
 		if (mungerp != NULL)
-			(*mungerp)(NULL, vt);
+			(*mungerp)(vt);
+#endif
 	} else
 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, 
 			BSDDBG_CODE(DBG_BSD_EXCP_SC, code) | DBG_FUNC_START,
@@ -194,9 +177,9 @@ unix_syscall(x86_saved_state_t *state)
 	kauth_cred_uthread_update(uthread, p);
 
 	uthread->uu_rval[0] = 0;
-	uthread->uu_rval[1] = regs->edx;
+	uthread->uu_rval[1] = 0;
 	uthread->uu_flag |= UT_NOTCANCELPT;
-
+	uthread->syscall_code = code;
 
 #ifdef JOE_DEBUG
         uthread->uu_iocount = 0;
@@ -205,7 +188,7 @@ unix_syscall(x86_saved_state_t *state)
 
 	AUDIT_SYSCALL_ENTER(code, p, uthread);
 	error = (*(callp->sy_call))((void *) p, (void *) vt, &(uthread->uu_rval[0]));
-        AUDIT_SYSCALL_EXIT(code, p, uthread, error);
+	AUDIT_SYSCALL_EXIT(code, p, uthread, error);
 
 #ifdef JOE_DEBUG
         if (uthread->uu_iocount)
@@ -230,6 +213,11 @@ unix_syscall(x86_saved_state_t *state)
 		    regs->eax = error;
 		    regs->efl |= EFL_CF;	/* carry bit */
 		} else { /* (not error) */
+			/*
+			 * We split retval across two registers, in case the
+			 * syscall had a 64-bit return value, in which case
+			 * eax/edx matches the function call ABI.
+			 */
 		    regs->eax = uthread->uu_rval[0];
 		    regs->edx = uthread->uu_rval[1];
 		} 
@@ -240,12 +228,6 @@ unix_syscall(x86_saved_state_t *state)
 		error, regs->eax, regs->edx);
 
 	uthread->uu_flag &= ~UT_NOTCANCELPT;
-#if FUNNEL_DEBUG
-	/*
-	 * if we're holding the funnel panic
-	 */
-	syscall_exit_funnelcheck();
-#endif /* FUNNEL_DEBUG */
 
 	if (__improbable(uthread->uu_lowpri_window)) {
 	        /*
@@ -255,7 +237,7 @@ unix_syscall(x86_saved_state_t *state)
 		 * delay in order to mitigate the impact of this
 		 * task on the normal operation of the system
 		 */
-		throttle_lowpri_io(TRUE);
+		throttle_lowpri_io(1);
 	}
 	if (__probable(code != 180))
 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, 
@@ -275,10 +257,11 @@ void
 unix_syscall64(x86_saved_state_t *state)
 {
 	thread_t	thread;
+	void			*vt;
 	unsigned int	code;
 	struct sysent	*callp;
-	void		*uargp;
 	int		args_in_regs;
+	boolean_t	args_start_at_rdi;
 	int		error;
 	struct proc	*p;
 	struct uthread	*uthread;
@@ -307,42 +290,50 @@ unix_syscall64(x86_saved_state_t *state)
 		thread_exception_return();
 		/* NOTREACHED */
 	}
-	args_in_regs = 6;
 
 	code = regs->rax & SYSCALL_NUMBER_MASK;
 	DEBUG_KPRINT_SYSCALL_UNIX(
 		"unix_syscall64: code=%d(%s) rip=%llx\n",
 		code, syscallnames[code >= NUM_SYSENT ? 63 : code], regs->isf.rip);
 	callp = (code >= NUM_SYSENT) ? &sysent[63] : &sysent[code];
-	uargp = (void *)(&regs->rdi);
+
+	vt = (void *)uthread->uu_arg;
 
 	if (__improbable(callp == sysent)) {
 	        /*
 		 * indirect system call... system call number
 		 * passed as 'arg0'
 		 */
-	        code = regs->rdi;
+		code = regs->rdi;
 		callp = (code >= NUM_SYSENT) ? &sysent[63] : &sysent[code];
-		uargp = (void *)(&regs->rsi);
+		args_start_at_rdi = FALSE;
 		args_in_regs = 5;
+	} else {
+		args_start_at_rdi = TRUE;
+		args_in_regs = 6;
 	}
 
 	if (callp->sy_narg != 0) {
+		assert(callp->sy_narg <= 8); /* size of uu_arg */
+
+		args_in_regs = MIN(args_in_regs, callp->sy_narg);
+		memcpy(vt, args_start_at_rdi ? &regs->rdi : &regs->rsi, args_in_regs * sizeof(syscall_arg_t));
+
+
 		if (code != 180) {
-			uint64_t *ip = (uint64_t *)uargp;
+			uint64_t *ip = (uint64_t *)vt;
 
 			KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, 
 				BSDDBG_CODE(DBG_BSD_EXCP_SC, code) | DBG_FUNC_START,
 				(int)(*ip), (int)(*(ip+1)), (int)(*(ip+2)), (int)(*(ip+3)), 0);
 		}
-		assert(callp->sy_narg <= 8);
 
 		if (__improbable(callp->sy_narg > args_in_regs)) {
 			int copyin_count;
 
-			copyin_count = (callp->sy_narg - args_in_regs) * sizeof(uint64_t);
+			copyin_count = (callp->sy_narg - args_in_regs) * sizeof(syscall_arg_t);
 
-			error = copyin((user_addr_t)(regs->isf.rsp + sizeof(user_addr_t)), (char *)&regs->v_arg6, copyin_count);
+			error = copyin((user_addr_t)(regs->isf.rsp + sizeof(user_addr_t)), (char *)&uthread->uu_arg[args_in_regs], copyin_count);
 			if (error) {
 				regs->rax = error;
 				regs->isf.rflags |= EFL_CF;
@@ -350,18 +341,10 @@ unix_syscall64(x86_saved_state_t *state)
 				/* NOTREACHED */
 			}
 		}
-		/*
-		 * XXX Turn 64 bit unsafe calls into nosys()
-		 */
-		if (__improbable(callp->sy_flags & UNSAFE_64BIT)) {
-			callp = &sysent[63];
-			goto unsafe;
-		}
 	} else
 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE,
 			BSDDBG_CODE(DBG_BSD_EXCP_SC, code) | DBG_FUNC_START,
 			0, 0, 0, 0, 0);
-unsafe:
 
 	/*
 	 * Delayed binding of thread credential to process credential, if we
@@ -371,9 +354,8 @@ unsafe:
 
 	uthread->uu_rval[0] = 0;
 	uthread->uu_rval[1] = 0;
-
-	
 	uthread->uu_flag |= UT_NOTCANCELPT;
+	uthread->syscall_code = code;
 
 #ifdef JOE_DEBUG
         uthread->uu_iocount = 0;
@@ -381,8 +363,8 @@ unsafe:
 #endif
 
 	AUDIT_SYSCALL_ENTER(code, p, uthread);
-	error = (*(callp->sy_call))((void *) p, uargp, &(uthread->uu_rval[0]));
-        AUDIT_SYSCALL_EXIT(code, p, uthread, error);
+	error = (*(callp->sy_call))((void *) p, vt, &(uthread->uu_rval[0]));
+	AUDIT_SYSCALL_EXIT(code, p, uthread, error);
 
 #ifdef JOE_DEBUG
         if (uthread->uu_iocount)
@@ -440,13 +422,6 @@ unsafe:
 	
 	uthread->uu_flag &= ~UT_NOTCANCELPT;
 
-#if FUNNEL_DEBUG	
-	/*
-	 * if we're holding the funnel panic
-	 */
-	syscall_exit_funnelcheck();
-#endif /* FUNNEL_DEBUG */
-
 	if (__improbable(uthread->uu_lowpri_window)) {
 	        /*
 		 * task is marked as a low priority I/O type
@@ -455,7 +430,7 @@ unsafe:
 		 * delay in order to mitigate the impact of this
 		 * task on the normal operation of the system
 		 */
-		throttle_lowpri_io(TRUE);
+		throttle_lowpri_io(1);
 	}
 	if (__probable(code != 180))
 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, 
@@ -474,7 +449,6 @@ unix_syscall_return(int error)
 	struct uthread		*uthread;
 	struct proc *p;
 	unsigned int code;
-	vm_offset_t params;
 	struct sysent *callp;
 
 	thread = current_thread();
@@ -489,16 +463,8 @@ unix_syscall_return(int error)
 
 		regs = saved_state64(find_user_regs(thread));
 
-		/* reconstruct code for tracing before blasting rax */
-		code = regs->rax & SYSCALL_NUMBER_MASK;
+		code = uthread->syscall_code;
 		callp = (code >= NUM_SYSENT) ? &sysent[63] : &sysent[code];
-
-		if (callp == sysent)
-			/*
-			 * indirect system call... system call number
-			 * passed as 'arg0'
-			 */
-			code = regs->rdi;
 
 #if CONFIG_DTRACE
 		if (callp->sy_call == dtrace_systrace_syscall)
@@ -553,8 +519,8 @@ unix_syscall_return(int error)
 		regs = saved_state32(find_user_regs(thread));
 
 		regs->efl &= ~(EFL_CF);
-		/* reconstruct code for tracing before blasting eax */
-		code = regs->eax & I386_SYSCALL_NUMBER_MASK;
+
+		code = uthread->syscall_code;
 		callp = (code >= NUM_SYSENT) ? &sysent[63] : &sysent[code];
 
 #if CONFIG_DTRACE
@@ -563,10 +529,6 @@ unix_syscall_return(int error)
 #endif /* CONFIG_DTRACE */
 		AUDIT_SYSCALL_EXIT(code, p, uthread, error);
 
-		if (callp == sysent) {
-			params = (vm_offset_t) (regs->uesp + sizeof (int));
-			code = fuword(params);
-		}
 		if (error == ERESTART) {
 			pal_syscall_restart( thread, find_user_regs(thread) );
 		}
@@ -587,13 +549,6 @@ unix_syscall_return(int error)
 
 	uthread->uu_flag &= ~UT_NOTCANCELPT;
 
-#if FUNNEL_DEBUG	
-	/*
-	 * if we're holding the funnel panic
-	 */
-	syscall_exit_funnelcheck();
-#endif /* FUNNEL_DEBUG */
-
 	if (uthread->uu_lowpri_window) {
 	        /*
 		 * task is marked as a low priority I/O type
@@ -602,7 +557,7 @@ unix_syscall_return(int error)
 		 * delay in order to mitigate the impact of this
 		 * task on the normal operation of the system
 		 */
-		throttle_lowpri_io(TRUE);
+		throttle_lowpri_io(1);
 	}
 	if (code != 180)
 		KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, 
@@ -612,47 +567,4 @@ unix_syscall_return(int error)
 	thread_exception_return();
 	/* NOTREACHED */
 }
-
-void
-munge_wwwlww(
-	__unused const void	*in32,
-	void			*out64)
-{
-	uint32_t	*arg32;
-	uint64_t	*arg64;
-
-	/* we convert in place in out64 */
-	arg32 = (uint32_t *) out64;
-	arg64 = (uint64_t *) out64;
-
-	arg64[5] = arg32[6];	/* wwwlwW */
-	arg64[4] = arg32[5];	/* wwwlWw */
-	arg32[7] = arg32[4];	/* wwwLww (hi) */
-	arg32[6] = arg32[3];	/* wwwLww (lo) */
-	arg64[2] = arg32[2];	/* wwWlww */
-	arg64[1] = arg32[1];	/* wWwlww */
-	arg64[0] = arg32[0];	/* Wwwlww */
-}	
-
-
-void
-munge_wwlwww(
-	__unused const void	*in32,
-	void			*out64)
-{
-	uint32_t	*arg32;
-	uint64_t	*arg64;
-
-	/* we convert in place in out64 */
-	arg32 = (uint32_t *) out64;
-	arg64 = (uint64_t *) out64;
-
-	arg64[5] = arg32[6];	/* wwlwwW */
-	arg64[4] = arg32[5];	/* wwlwWw */
-	arg64[3] = arg32[4];	/* wwlWww  */
-	arg32[5] = arg32[3];	/* wwLwww (hi) */
-	arg32[4] = arg32[2];	/* wwLwww (lo) */
-	arg64[1] = arg32[1];	/* wWlwww */
-	arg64[0] = arg32[0];	/* Wwlwww */
-}	
 

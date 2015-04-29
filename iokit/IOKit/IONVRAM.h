@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 1998-2000 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1998-2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2007-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -81,18 +82,19 @@ private:
   OSDictionary      *_ofDict;
   OSDictionary      *_nvramPartitionOffsets;
   OSDictionary      *_nvramPartitionLengths;
-  UInt32            _xpramPartitionOffset;
-  UInt32            _xpramPartitionSize;
-  UInt8             *_xpramImage;
-  UInt32            _nrPartitionOffset;
-  UInt32            _nrPartitionSize;
-  UInt8             *_nrImage;
+  UInt32            _resv0 __unused;
+  UInt32            _resv1 __unused;
+  IOLock            *_ofLock;
+  UInt32            _resv2 __unused;
+  UInt32            _resv3 __unused;
+  UInt8             *_resv4 __unused;
   UInt32            _piPartitionOffset;
   UInt32            _piPartitionSize;
   UInt8             *_piImage;
   bool              _systemPaniced;
   SInt32            _lastDeviceSync;
   bool              _freshInterval;
+  bool              _isProxied;
   
   virtual UInt8 calculatePartitionChecksum(UInt8 *partitionHeader);
   virtual IOReturn initOFVariables(void);
@@ -132,6 +134,9 @@ private:
 					   const OSSymbol *name,
 					   OSData *value);
   
+  void initNVRAMImage(void);
+  void initProxyData(void);
+  
 public:
   virtual bool init(IORegistryEntry *old, const IORegistryPlane *plane);
   
@@ -140,6 +145,8 @@ public:
   virtual void sync(void);
   
   virtual bool serializeProperties(OSSerialize *s) const;
+  virtual OSObject *copyProperty(const OSSymbol *aKey) const;
+  virtual OSObject *copyProperty(const char *aKey) const;
   virtual OSObject *getProperty(const OSSymbol *aKey) const;
   virtual OSObject *getProperty(const char *aKey) const;
   virtual bool setProperty(const OSSymbol *aKey, OSObject *anObject);

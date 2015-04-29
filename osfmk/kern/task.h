@@ -110,12 +110,14 @@
 #include <kern/cpu_data.h>
 #include <kern/queue.h>
 #include <kern/exception.h>
-#include <kern/lock.h>
+#include <kern/locks.h>
 #include <security/_label.h>
-#include <ipc/ipc_labelh.h>
+#include <ipc/ipc_port.h>
 #endif /* MACH_KERNEL_PRIVATE */
 
 #ifdef XNU_KERNEL_PRIVATE
+
+#include <mach/sfi_class.h>
 
 /* defns for task->rsu_controldata */
 #define TASK_POLICY_CPU_RESOURCE_USAGE		0
@@ -127,59 +129,8 @@
 
 #define TASK_POLICY_RESOURCE_USAGE_COUNT 6
 
-/*
- * Process Action and Policy bit definitions 
-
-The bit defns of the policy states 
-64   60    56   52   48   44   40   36   32   28   24   20   16   12   8        0
-|----|-----|----|----|----|----|----|----|----|----|----|----|----|----|--------| 
-|RFU | RFU | PWR| NET| DSK| CPU| VM | WM | LVM| RFU| CPU| NET| GPU| DSK| BGRND  |
-|----|-----|----|----|----|----|----|----|----|----|----|----|----|----|--------| 
-|<-----------   RESOURCE USAGE  -------->|< LOWSRC>|<-HARDWARE ACCESS->|BackGrnd|     
-|----|-----|----|----|----|----|----|----|----|----|----|----|----|----|--------| 
-
-*
-*/
-
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_NONE		0x00
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_LOWPRI		0x01
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_DISKTHROTTLE	0x02
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_NETTHROTTLE	0x04
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_NOGPU		0x08
-#if CONFIG_EMBEDDED
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_ALL		0x0F
-#else /* CONFIG_EMBEDDED */
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_ALL		0x07
-#endif /* CONFIG_EMBEDDED */
-#define TASK_POLICY_BACKGROUND_ATTRIBUTE_DEFAULT	TASK_POLICY_BACKGROUND_ATTRIBUTE_ALL
-
-/* Hardware disk access attributes, bit different as it should reflect IOPOL_XXX */
-#define TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_NONE	0x00
-#define TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_FULLACCESS	0x01
-#define TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_NORMAL	0x01
-#define TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_PASSIVE	0x02
-#define TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_THROTTLE	0x03
-#define TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_UTILITY	0x04
-#define TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_DEFAULT	TASK_POLICY_HWACCESS_DISK_ATTRIBUTE_FULLACCESS
-
-/* Hardware GPU access attributes */
-#define TASK_POLICY_HWACCESS_GPU_ATTRIBUTE_NONE		0x00
-#define TASK_POLICY_HWACCESS_GPU_ATTRIBUTE_FULLACCESS	0x00
-#define TASK_POLICY_HWACCESS_GPU_ATTRIBUTE_NOACCESS	0x01
-#define TASK_POLICY_HWACCESS_GPU_ATTRIBUTE_DEFAULT	TASK_POLICY_HWACCESS_GPU_ATTRIBUTE_FULLACCESS
-
-/* Hardware Network access attributes */
-#define TASK_POLICY_HWACCESS_NET_ATTRIBUTE_NONE		0x00
-#define TASK_POLICY_HWACCESS_NET_ATTRIBUTE_FULLACCESS	0x00
-#define TASK_POLICY_HWACCESS_NET_ATTRIBUTE_THROTTLE	0x01
-#define TASK_POLICY_HWACCESS_NET_ATTRIBUTE_DEFAULT	TASK_POLICY_HWACCESS_NET_ATTRIBUTE_FULLACCESS
-
-/* Hardware CPU access attributes */
-#define TASK_POLICY_HWACCESS_CPU_ATTRIBUTE_NONE		0x00
-#define TASK_POLICY_HWACCESS_CPU_ATTRIBUTE_FULLACCESS	0x00
-#define TASK_POLICY_HWACCESS_CPU_ATTRIBUTE_ONE		0x01
-#define TASK_POLICY_HWACCESS_CPU_ATTRIBUTE_LLCACHE	0x02
-#define TASK_POLICY_HWACCESS_CPU_ATTRIBUTE_DEFAULT	TASK_POLICY_HWACCESS_CPU_ATTRIBUTE_FULLACCESS
+#define	TASK_POLICY_CPUMON_DISABLE			0xFF
+#define	TASK_POLICY_CPUMON_DEFAULTS			0xFE
 
 /* Resource usage/low resource attributes */
 #define TASK_POLICY_RESOURCE_ATTRIBUTE_NONE		0x00
@@ -194,42 +145,26 @@ The bit defns of the policy states
 
 #ifdef MACH_KERNEL_PRIVATE
 
-typedef struct process_policy {
-	uint64_t  apptype:4,
-		  rfu1:4,
-		  ru_power:4,	/* Resource Usage Power */
-		  ru_net:4,	/* Resource Usage Network */
-		  ru_disk:4,	/* Resource Usage Disk */
-		  ru_cpu:4,	/* Resource Usage CPU */
-		  ru_virtmem:4,	/* Resource Usage VM */
-		  ru_wiredmem:4,/* Resource Usage Wired Memory */
-		  low_vm:4,	/* Low Virtual Memory */
-		  rfu2:4,
-		  hw_cpu:4,	/* HW Access to CPU */
-		  hw_net:4,	/* HW Access to Network */
-		  hw_gpu:4,	/* HW Access to GPU */
-		  hw_disk:4,	/* HW Access to Disk */
-		  hw_bg:8;	/* Darwin Background Policy */
-} process_policy_t;
-
-#if CONFIG_EMBEDDED
-
-typedef struct task_watcher {
-	queue_chain_t	tw_links;		/* queueing of threads */
-	task_t		tw_task;	/* task that is being watched */
-	thread_t	tw_thread;	/* thread that is watching the watch_task */
-	int		tw_state;	/* the current app state of the thread */
-	int		tw_importance;	/* importance prior to backgrounding */
-} task_watch_t;
-
-extern lck_mtx_t task_watch_mtx;
-
-#endif /* CONFIG_EMBEDDED */
 
 #include <kern/thread.h>
 
-extern process_policy_t default_task_proc_policy;	/* init value for the process policy attributes */
-extern process_policy_t default_task_null_policy;	/* none as the value for the process policy attributes */
+#ifdef CONFIG_ATM
+#include <atm/atm_internal.h>
+#endif
+
+struct _cpu_time_qos_stats {
+        uint64_t cpu_time_qos_default;
+        uint64_t cpu_time_qos_maintenance;
+        uint64_t cpu_time_qos_background;
+        uint64_t cpu_time_qos_utility;
+        uint64_t cpu_time_qos_legacy;
+        uint64_t cpu_time_qos_user_initiated;
+        uint64_t cpu_time_qos_user_interactive;
+};
+
+#ifdef CONFIG_BANK
+#include <bank/bank_internal.h>
+#endif
 
 struct task {
 	/* Synchronization/destruction information */
@@ -243,6 +178,10 @@ struct task {
 	queue_chain_t	tasks;	/* global list of tasks */
 	void		*user_data;	/* Arbitrary data settable via IPC */
 
+#if defined(CONFIG_SCHED_MULTIQ)
+	sched_group_t sched_group;
+#endif /* defined(CONFIG_SCHED_MULTIQ) */
+
 	/* Threads in this task */
 	queue_head_t		threads;
 
@@ -255,11 +194,12 @@ struct task {
 
 	/* User-visible scheduling information */
 	integer_t		user_stop_count;	/* outstanding stops */
-
-	task_role_t		role;
+	integer_t		legacy_stop_count;	/* outstanding legacy stops */
 
 	integer_t		priority;			/* base priority for threads */
 	integer_t		max_priority;		/* maximum priority for threads */
+
+	integer_t		importance;		/* priority offset (BSD 'nice' value) */
 
 	/* Task security and audit tokens */
 	security_token_t sec_token;
@@ -268,7 +208,7 @@ struct task {
 	/* Statistics */
 	uint64_t		total_user_time;	/* terminated threads only */
 	uint64_t		total_system_time;
-
+	
 	/* Virtual timers */
 	uint32_t		vtimers;
 
@@ -283,7 +223,9 @@ struct task {
 	struct ipc_port *itk_bootstrap;	/* a send right */
 	struct ipc_port *itk_seatbelt;	/* a send right */
 	struct ipc_port *itk_gssd;	/* yet another send right */
+	struct ipc_port *itk_debug_control; /* send right for debugmode communications */
 	struct ipc_port *itk_task_access; /* and another send right */ 
+	struct ipc_port *itk_resume;	/* a receive right to resume this task */
 	struct ipc_port *itk_registered[TASK_PORT_REGISTER_MAX];
 					/* all send rights */
 
@@ -291,9 +233,7 @@ struct task {
 
 	/* Synchronizer ownership information */
 	queue_head_t	semaphore_list;		/* list of owned semaphores   */
-	queue_head_t	lock_set_list;		/* list of owned lock sets    */
 	int		semaphores_owned;	/* number of semaphores owned */
-	int 		lock_sets_owned;	/* number of lock sets owned  */
 
 	ledger_t	ledger;
 
@@ -319,33 +259,40 @@ struct task {
 	void *bsd_info;
 #endif  
 	struct vm_shared_region		*shared_region;
-	uint32_t taskFeatures[2];		/* Special feature for this task */
-#define tf64BitAddr	0x80000000		/* Task has 64-bit addressing */
-#define tf64BitData	0x40000000		/* Task has 64-bit data registers */
+	volatile uint32_t t_flags;                                      /* general-purpose task flags protected by task_lock (TL) */
+#define TF_64B_ADDR             0x00000001                              /* task has 64-bit addressing */
+#define TF_64B_DATA             0x00000002                              /* task has 64-bit data registers */
+#define TF_CPUMON_WARNING       0x00000004                              /* task has at least one thread in CPU usage warning zone */
+#define TF_WAKEMON_WARNING      0x00000008                              /* task is in wakeups monitor warning zone */
+#define TF_TELEMETRY            (TF_CPUMON_WARNING | TF_WAKEMON_WARNING) /* task is a telemetry participant */
+#define TF_GPU_DENIED           0x00000010                              /* task is not allowed to access the GPU */
+
 #define task_has_64BitAddr(task)	\
-	 (((task)->taskFeatures[0] & tf64BitAddr) != 0)
+	 (((task)->t_flags & TF_64B_ADDR) != 0)
 #define task_set_64BitAddr(task)	\
-	 ((task)->taskFeatures[0] |= tf64BitAddr)
+	 ((task)->t_flags |= TF_64B_ADDR)
 #define task_clear_64BitAddr(task)	\
-	 ((task)->taskFeatures[0] &= ~tf64BitAddr)
+	 ((task)->t_flags &= ~TF_64B_ADDR)
+#define task_has_64BitData(task)    \
+	 (((task)->t_flags & TF_64B_DATA) != 0)
 
 	mach_vm_address_t	all_image_info_addr; /* dyld __all_image_info     */
 	mach_vm_size_t		all_image_info_size; /* section location and size */
-#if CONFIG_MACF_MACH
-	ipc_labelh_t label;
-#endif
 
-#if CONFIG_COUNTERS
-#define TASK_PMC_FLAG 0x1	/* Bit in "t_chud" signifying PMC interest */
+#if CONFIG_COUNTERS || KPERF
+#define TASK_PMC_FLAG			0x1	/* Bit in "t_chud" signifying PMC interest */
+#define TASK_KPC_FORCED_ALL_CTRS	0x2	/* Bit in "t_chud" signifying KPC forced all counters */
+
 	uint32_t t_chud;		/* CHUD flags, used for Shark */
 #endif
 
 	boolean_t pidsuspended; /* pid_suspend called; no threads can execute */
 	boolean_t frozen;       /* frozen; private resident pages committed to swap */
-	process_policy_t ext_appliedstate;	/* externally applied actions */
-	process_policy_t ext_policystate;	/* externally defined process policy states*/
-	process_policy_t appliedstate;		/* self applied acions */
-	process_policy_t policystate;		/* process wide policy states */
+	boolean_t changing_freeze_state;	/* in the process of freezing or thawing */
+	uint16_t policy_ru_cpu          :4,
+	         policy_ru_cpu_ext      :4,
+	         applied_ru_cpu         :4,
+	         applied_ru_cpu_ext     :4;
 	uint8_t  rusage_cpu_flags;
 	uint8_t  rusage_cpu_percentage;		/* Task-wide CPU limit percentage */
 	uint64_t rusage_cpu_interval;		/* Task-wide CPU limit interval */
@@ -353,41 +300,88 @@ struct task {
 	uint64_t rusage_cpu_perthr_interval;    /* Per-thread CPU limit interval */
 	uint64_t rusage_cpu_deadline;
 	thread_call_t rusage_cpu_callt;
-#if CONFIG_EMBEDDED
-	uint32_t	appstate;		/* the current appstate */
-	queue_head_t	task_watchers;		/* app state watcher threads */
-	int	num_taskwatchers;
-	int		watchapplying;
-#endif /* CONFIG_EMBEDDED */
+
+#if CONFIG_ATM
+	struct atm_task_descriptor *atm_context;  /* pointer to per task atm descriptor */
+#endif
+#if CONFIG_BANK
+	struct bank_task *bank_context;  /* pointer to per task bank structure */
+#endif
+
+#if IMPORTANCE_INHERITANCE
+	struct ipc_importance_task  *task_imp_base;	/* Base of IPC importance chain */
+#endif /* IMPORTANCE_INHERITANCE */
 
 	vm_extmod_statistics_data_t	extmod_statistics;
-	natural_t	proc_terminate;	/* the process is marked for proc_terminate */
+
+#if MACH_ASSERT
+	int8_t		suspends_outstanding;	/* suspends this task performed in excess of resumes */
+#endif
+
+	struct task_requested_policy requested_policy;
+	struct task_effective_policy effective_policy;
+	struct task_pended_policy    pended_policy;
+
+	/*
+	 * Can be merged with imp_donor bits, once the IMPORTANCE_INHERITANCE macro goes away.
+	 */
+	uint32_t        low_mem_notified_warn     :1,    /* warning low memory notification is sent to the task */
+	                low_mem_notified_critical :1,    /* critical low memory notification is sent to the task */
+	                purged_memory_warn        :1,    /* purgeable memory of the task is purged for warning level pressure */
+	                purged_memory_critical    :1,    /* purgeable memory of the task is purged for critical level pressure */
+	                mem_notify_reserved       :28;   /* reserved for future use */
+
+	io_stat_info_t 	task_io_stats;
+	
+	/* 
+	 * The cpu_time_qos_stats fields are protected by the task lock
+	 */
+	struct _cpu_time_qos_stats 	cpu_time_qos_stats;
+
+	/* Statistics accumulated for terminated threads from this task */
+	uint32_t	task_timer_wakeups_bin_1;
+	uint32_t	task_timer_wakeups_bin_2;
+	uint64_t	task_gpu_ns;
+
+	/* # of purgeable volatile VM objects owned by this task: */
+	int		task_volatile_objects;
+	/* # of purgeable but not volatile VM objects owned by this task: */
+	int		task_nonvolatile_objects;
+	boolean_t	task_purgeable_disowning;
+	boolean_t	task_purgeable_disowned;
+
+	/* Coalition is set in task_create_internal and unset in task_deallocate_internal, so it can be referenced without the task lock. */
+	coalition_t	coalition;		/* coalition this task belongs to */
+	/* These fields are protected by coalition->lock, not the task lock. */
+	queue_chain_t	coalition_tasks;	/* list of tasks in the coalition */
+
+#if HYPERVISOR
+	void *hv_task_target; /* hypervisor virtual machine object associated with this task */
+#endif /* HYPERVISOR */
 };
 
-#define task_lock(task)		lck_mtx_lock(&(task)->lock)
-#define task_lock_try(task)	lck_mtx_try_lock(&(task)->lock)
-#define task_unlock(task)	lck_mtx_unlock(&(task)->lock)
-
-#if CONFIG_MACF_MACH
-#define maclabel label->lh_label
-
-#define tasklabel_lock(task)	lh_lock((task)->label)
-#define tasklabel_unlock(task)	lh_unlock((task)->label)
-
-extern void tasklabel_lock2(task_t a, task_t b);
-extern void tasklabel_unlock2(task_t a, task_t b);
-#endif /* MAC_MACH */
+#define task_lock(task)		 	lck_mtx_lock(&(task)->lock)
+#define	task_lock_assert_owned(task)	lck_mtx_assert(&(task)->lock, LCK_MTX_ASSERT_OWNED)
+#define task_lock_try(task)	 	lck_mtx_try_lock(&(task)->lock)
+#define task_unlock(task)	 	lck_mtx_unlock(&(task)->lock)
 
 #define	itk_lock_init(task)	lck_mtx_init(&(task)->itk_lock_data, &ipc_lck_grp, &ipc_lck_attr)
 #define	itk_lock_destroy(task)	lck_mtx_destroy(&(task)->itk_lock_data, &ipc_lck_grp)
 #define	itk_lock(task)		lck_mtx_lock(&(task)->itk_lock_data)
 #define	itk_unlock(task)	lck_mtx_unlock(&(task)->itk_lock_data)
 
+#define TASK_REFERENCE_LEAK_DEBUG 0
+
+#if TASK_REFERENCE_LEAK_DEBUG
+extern void task_reference_internal(task_t task);
+extern uint32_t task_deallocate_internal(task_t task);
+#else
 #define task_reference_internal(task)		\
 			(void)hw_atomic_add(&(task)->ref_count, 1)
 
 #define task_deallocate_internal(task)		\
 			hw_atomic_sub(&(task)->ref_count, 1)
+#endif
 
 #define task_reference(task)					\
 MACRO_BEGIN										\
@@ -402,7 +396,10 @@ extern kern_return_t	kernel_task_create(
 							task_t 			*child);
 
 /* Initialize task module */
-extern void		task_init(void) __attribute__((section("__TEXT, initcode")));
+extern void		task_init(void);
+
+/* coalition_init() calls this to initialize ledgers before task_init() */
+extern void		init_task_ledgers(void);
 
 #define	current_task_fast()	(current_thread()->task)
 #define current_task()		current_task_fast()
@@ -449,6 +446,11 @@ extern kern_return_t    task_pidsuspend_locked(
 extern kern_return_t    task_pidresume(
 							task_t		task);
 
+extern kern_return_t	task_send_trace_memory(
+							task_t		task,
+							uint32_t	pid,
+							uint64_t	uniqueid);
+
 #if CONFIG_FREEZE
 
 /* Freeze a task's resident pages */
@@ -481,6 +483,7 @@ extern kern_return_t	task_terminate_internal(
 
 extern kern_return_t	task_create_internal(
 							task_t		parent_task,
+							coalition_t	parent_coalition,
 							boolean_t	inherit_memory,
 							boolean_t	is_64bit,
 							task_t		*child_task);	/* OUT */
@@ -488,6 +491,14 @@ extern kern_return_t	task_create_internal(
 extern kern_return_t	task_importance(
 							task_t			task,
 							integer_t		importance);
+
+extern void 		task_power_info_locked(
+							task_t			task,
+							task_power_info_t	info,
+					       gpu_energy_data_t gpu_energy);
+
+extern uint64_t		task_gpu_utilisation(
+							task_t	 task);
 
 extern void		task_vtimer_set(
 					task_t		task,
@@ -530,6 +541,15 @@ extern vm_map_t get_task_map_reference(task_t);
 extern vm_map_t	swap_task_map(task_t, thread_t, vm_map_t, boolean_t);
 extern pmap_t	get_task_pmap(task_t);
 extern uint64_t	get_task_resident_size(task_t);
+extern uint64_t	get_task_compressed(task_t);
+extern uint64_t	get_task_resident_max(task_t);
+extern uint64_t	get_task_phys_footprint(task_t);
+extern uint64_t	get_task_phys_footprint_max(task_t);
+extern uint64_t	get_task_purgeable_size(task_t);
+extern uint64_t	get_task_cpu_time(task_t);
+
+extern kern_return_t task_set_phys_footprint_limit_internal(task_t, int, int *, boolean_t);
+extern kern_return_t task_get_phys_footprint_limit(task_t task, int *limit_mb);
 
 extern boolean_t	is_kerneltask(task_t task);
 
@@ -555,104 +575,231 @@ struct _task_ledger_indices {
 	int tkm_shared;
 	int phys_mem;
 	int wired_mem;
+	int internal;
+	int iokit_mapped;
+	int alternate_accounting;
+	int phys_footprint;
+	int internal_compressed;
+	int purgeable_volatile;
+	int purgeable_nonvolatile;
+	int purgeable_volatile_compressed;
+	int purgeable_nonvolatile_compressed;
+	int platform_idle_wakeups;
+	int interrupt_wakeups;
+        int sfi_wait_times[MAX_SFI_CLASS_ID];
+#ifdef CONFIG_BANK
+	int cpu_time_billed_to_me;
+	int cpu_time_billed_to_others;
+#endif
 };
 extern struct _task_ledger_indices task_ledgers;
 
-int proc_get_task_bg_policy(task_t task);
-int proc_get_thread_bg_policy(task_t task, uint64_t tid);
-int proc_get_self_isbackground(void);
-int proc_get_selfthread_isbackground(void);
+/* Begin task_policy */
 
-int proc_get_darwinbgstate(task_t, uint32_t *);
-int proc_set_bgtaskpolicy(task_t task, int intval);
-int proc_set_and_apply_bgtaskpolicy(task_t task, int intval);
-int proc_set_bgthreadpolicy(task_t task, uint64_t tid, int val);
-int proc_set_and_apply_bgthreadpolicy(task_t task, uint64_t tid, int val);
+/* value */
+#define TASK_POLICY_DISABLE             0x0
+#define TASK_POLICY_ENABLE              0x1
 
-int proc_add_bgtaskpolicy(task_t task, int val);
-int proc_add_bgthreadpolicy(task_t task, uint64_t tid, int val);
-int proc_remove_bgtaskpolicy(task_t task, int policy);
-int proc_remove_bgthreadpolicy(task_t task, uint64_t tid, int val);
+/* category */
+#define TASK_POLICY_INTERNAL            0x0
+#define TASK_POLICY_EXTERNAL            0x1
+#define TASK_POLICY_ATTRIBUTE           0x2
 
-int proc_apply_bgtaskpolicy(task_t task);
-int proc_apply_bgtaskpolicy_external(task_t task);
-int proc_apply_bgthreadpolicy(task_t task, uint64_t tid);
-int proc_apply_bgtask_selfpolicy(void);
-int proc_apply_bgthread_selfpolicy(void);
-int proc_apply_workq_bgthreadpolicy(thread_t);
+/* for tracing */
+#define TASK_POLICY_TASK                0x4
+#define TASK_POLICY_THREAD              0x8
 
-int proc_restore_bgtaskpolicy(task_t task);
-int proc_restore_bgthreadpolicy(task_t task, uint64_t tid);
-int proc_restore_bgthread_selfpolicy(void);
-int proc_restore_workq_bgthreadpolicy(thread_t);
-void proc_task_remove_throttle(task_t task);
+/* flavors (also DBG_IMPORTANCE subclasses  0x20 - 0x3F) */
 
-/* hw access routines */
-int proc_apply_task_diskacc(task_t task, int policy);
-int proc_apply_thread_diskacc(task_t task, uint64_t tid, int policy);
-int proc_apply_thread_selfdiskacc(int policy);
-int proc_get_task_disacc(task_t task);
-int proc_get_task_selfdiskacc(void);
-int proc_get_diskacc(thread_t thread);
-int proc_get_thread_selfdiskacc(void);
-int proc_denyinherit_policy(task_t task);
-int proc_denyselfset_policy(task_t task);
+/* internal or external, thread or task */
+#define TASK_POLICY_DARWIN_BG           0x21
+#define TASK_POLICY_IOPOL               0x22
+#define TASK_POLICY_IO                  0x23
+#define TASK_POLICY_PASSIVE_IO          0x24
 
-int proc_get_task_selfgpuacc_deny(void);
-int proc_apply_task_gpuacc(task_t task, int prio);
+/* internal, task only */
+#define TASK_POLICY_DARWIN_BG_IOPOL     0x27
 
-int proc_get_task_ruse_cpu(task_t task, uint32_t * policyp, uint32_t * percentagep, uint64_t * intervalp, uint64_t * deadlinep);
-int proc_set_task_ruse_cpu(task_t task, uint32_t policy, uint32_t percentage, uint64_t interval, uint64_t deadline);
-int proc_clear_task_ruse_cpu(task_t task);
+/* task-only attributes */
+#define TASK_POLICY_TAL                 0x28
+#define TASK_POLICY_BOOST               0x29
+#define TASK_POLICY_ROLE                0x2A
+#define TASK_POLICY_SUPPRESSED_CPU      0x2B
+#define TASK_POLICY_TERMINATED          0x2C
+#define TASK_POLICY_NEW_SOCKETS_BG      0x2D
+#define TASK_POLICY_LOWPRI_CPU          0x2E
+#define TASK_POLICY_LATENCY_QOS         0x2F
+#define TASK_POLICY_THROUGH_QOS         0x30
+#define TASK_POLICY_WATCHERS_BG         0x31
+
+#define TASK_POLICY_SFI_MANAGED         0x34
+#define TASK_POLICY_ALL_SOCKETS_BG      0x37
+
+#define TASK_POLICY_BASE_LATENCY_AND_THROUGHPUT_QOS  0x39 /* latency as value1, throughput as value2 */
+#define TASK_POLICY_OVERRIDE_LATENCY_AND_THROUGHPUT_QOS  0x3A /* latency as value1, throughput as value2 */
+
+/* thread-only attributes */
+#define TASK_POLICY_PIDBIND_BG          0x32
+#define TASK_POLICY_WORKQ_BG            0x33
+#define TASK_POLICY_QOS                 0x35
+#define TASK_POLICY_QOS_OVERRIDE        0x36
+#define TASK_POLICY_QOS_AND_RELPRIO     0x38 /* QoS as value1, relative priority as value2 */
+
+#define TASK_POLICY_MAX                 0x3F
+
+/* The main entrance to task policy is this function */
+extern void proc_set_task_policy(task_t task, thread_t thread, int category, int flavor, int value);
+extern int  proc_get_task_policy(task_t task, thread_t thread, int category, int flavor);
+
+/* For attributes that have two scalars as input/output */
+extern void proc_set_task_policy2(task_t task, thread_t thread, int category, int flavor, int value1, int value2);
+extern void proc_get_task_policy2(task_t task, thread_t thread, int category, int flavor, int *value1, int *value2);
+
+/* For use by kernel threads and others who don't hold a reference on the target thread */
+extern void proc_set_task_policy_thread(task_t task, uint64_t tid, int category, int flavor, int value);
+
+extern void proc_set_task_spawnpolicy(task_t task, int apptype, int qos_clamp,
+                                      ipc_port_t * portwatch_ports, int portwatch_count);
+
+extern void task_set_main_thread_qos(task_t task, thread_t main_thread);
+
+/* IO Throttle tiers */
+#define THROTTLE_LEVEL_NONE     -1
+#define	THROTTLE_LEVEL_TIER0     0      /* IOPOL_NORMAL, IOPOL_DEFAULT, IOPOL_PASSIVE */
+
+#define THROTTLE_LEVEL_THROTTLED 1
+#define THROTTLE_LEVEL_TIER1     1      /* IOPOL_STANDARD */
+#define THROTTLE_LEVEL_TIER2     2      /* IOPOL_UTILITY */
+#define THROTTLE_LEVEL_TIER3     3      /* IOPOL_THROTTLE */
+
+#define THROTTLE_LEVEL_START     0
+#define THROTTLE_LEVEL_END       3
+
+#define THROTTLE_LEVEL_COMPRESSOR_TIER0		THROTTLE_LEVEL_TIER0
+#define THROTTLE_LEVEL_COMPRESSOR_TIER1		THROTTLE_LEVEL_TIER1
+#define THROTTLE_LEVEL_COMPRESSOR_TIER2		THROTTLE_LEVEL_TIER2
+
+#define THROTTLE_LEVEL_PAGEOUT_THROTTLED        THROTTLE_LEVEL_TIER2
+#define THROTTLE_LEVEL_PAGEOUT_UNTHROTTLED      THROTTLE_LEVEL_TIER1
+
+#if CONFIG_IOSCHED
+#define IOSCHED_METADATA_TIER 			THROTTLE_LEVEL_TIER1
+#endif /* CONFIG_IOSCHED */
+
+extern int proc_apply_workq_bgthreadpolicy(thread_t thread);
+extern int proc_restore_workq_bgthreadpolicy(thread_t thread);
+
+extern int proc_get_darwinbgstate(task_t task, uint32_t *flagsp);
+extern boolean_t proc_task_is_tal(task_t task);
+extern integer_t task_grab_latency_qos(task_t task);
+extern void task_policy_create(task_t task, int parent_boosted);
+extern void thread_policy_create(thread_t thread);
+
+/*
+ * for IPC importance hooks into task policy
+ */
+typedef struct task_pend_token {
+	uint32_t        tpt_update_sockets      :1,
+	                tpt_update_timers       :1,
+	                tpt_update_watchers     :1,
+	                tpt_update_live_donor   :1;
+} *task_pend_token_t;
+
+extern void task_policy_update_complete_unlocked(task_t task, thread_t thread, task_pend_token_t pend_token);
+extern void task_update_boost_locked(task_t task, boolean_t boost_active, task_pend_token_t pend_token);
+extern void task_set_boost_locked(task_t task, boolean_t boost_active);
+
+/*
+ * Get effective policy
+ * Only for use by relevant subsystem, should never be passed into a setter!
+ */
+
+extern int proc_get_effective_task_policy(task_t task, int flavor);
+extern int proc_get_effective_thread_policy(thread_t thread, int flavor);
+
+/* temporary compatibility */
+int proc_setthread_saved_importance(thread_t thread, int importance);
+
+int proc_get_task_ruse_cpu(task_t task, uint32_t *policyp, uint8_t *percentagep, uint64_t *intervalp, uint64_t *deadlinep);
+int proc_set_task_ruse_cpu(task_t task, uint32_t policy, uint8_t percentage, uint64_t interval, uint64_t deadline, int cpumon_entitled);
+int proc_clear_task_ruse_cpu(task_t task, int cpumon_entitled);
 thread_t task_findtid(task_t, uint64_t);
+void set_thread_iotier_override(thread_t, int policy);
 
-#define TASK_RUSECPU_FLAGS_PROC_LIMIT	0x1
-#define TASK_RUSECPU_FLAGS_PERTHR_LIMIT	0x2
-#define TASK_RUSECPU_FLAGS_DEADLINE		0x4
+boolean_t proc_thread_qos_add_override(task_t task, thread_t thread, uint64_t tid, int override_qos, boolean_t first_override_for_resource);
+boolean_t proc_thread_qos_remove_override(task_t task, thread_t thread, uint64_t tid);
 
-#define PROC_POLICY_OSX_APPTYPE_NONE		0
-#if CONFIG_EMBEDDED
-#define PROC_POLICY_IOS_RESV1_APPTYPE		1
-#define PROC_POLICY_IOS_APPLE_DAEMON		2
-#define PROC_POLICY_IOS_APPTYPE			3
-#define PROC_POLICY_IOS_NONUITYPE		4
-#else
-#define PROC_POLICY_OSX_APPTYPE_TAL		1
-#define PROC_POLICY_OSX_APPTYPE_WIDGET		2
-#define PROC_POLICY_OSX_APPTYPE_DBCLIENT	2	/* Not a bug, just rename of widget */
-#endif
-
-void proc_set_task_apptype(task_t task, int type, thread_t thread);
-int proc_disable_task_apptype(task_t task, int policy_subtype);
-int proc_enable_task_apptype(task_t task, int policy_subtype);
-
-#if CONFIG_EMBEDDED
-extern int proc_setthread_saved_importance(thread_t thread, int importance);
-#endif
+#define TASK_RUSECPU_FLAGS_PROC_LIMIT			0x01
+#define TASK_RUSECPU_FLAGS_PERTHR_LIMIT			0x02
+#define TASK_RUSECPU_FLAGS_DEADLINE			0x04
+#define	TASK_RUSECPU_FLAGS_FATAL_CPUMON			0x08	/* CPU usage monitor violations are fatal */
+#define	TASK_RUSECPU_FLAGS_FATAL_WAKEUPSMON		0x10	/* wakeups monitor violations are fatal */
+#define	TASK_RUSECPU_FLAGS_PHYS_FOOTPRINT_EXCEPTION	0x20	/* exceeding physical footprint generates EXC_RESOURCE */
 
 /* BSD call back functions */
 extern int proc_apply_resource_actions(void * p, int type, int action);
 extern int proc_restore_resource_actions(void * p, int type, int action);
 extern int task_restore_resource_actions(task_t task, int type);
 
-extern void proc_apply_task_networkbg(void * bsd_info);
-extern void proc_restore_task_networkbg(void * bsd_info);
-extern void proc_set_task_networkbg(void * bsd_info, int setbg);
-extern int task_clear_cpuusage(task_t task);
+extern int task_clear_cpuusage(task_t task, int cpumon_entitled);
 
-#if CONFIG_EMBEDDED
-#define TASK_APPSTATE_NONE              0
-#define TASK_APPSTATE_ACTIVE            1
-#define TASK_APPSTATE_BACKGROUND        2
-#define TASK_APPSTATE_NONUI             3
-#define TASK_APPSTATE_INACTIVE          4
+extern kern_return_t task_wakeups_monitor_ctl(task_t task, uint32_t *rate_hz, int32_t *flags);
+extern kern_return_t task_cpu_usage_monitor_ctl(task_t task, uint32_t *flags);
 
-extern int proc_lf_getappstate(task_t task);
-extern int proc_lf_setappstate(task_t task, int state);
-extern int proc_lf_pidbind(task_t curtask, uint64_t tid, task_t target_task, int bind);
-extern void thead_remove_taskwatch(thread_t thread);
-extern void task_removewatchers(task_t task);
-#endif /* CONFIG_EMBEDDED */
+
+extern void task_importance_mark_donor(task_t task, boolean_t donating);
+extern void task_importance_mark_live_donor(task_t task, boolean_t donating);
+extern void task_importance_mark_receiver(task_t task, boolean_t receiving);
+extern void task_importance_mark_denap_receiver(task_t task, boolean_t denap);
+extern void task_importance_reset(task_t task);
+extern void task_atm_reset(task_t task);
+
+#if IMPORTANCE_INHERITANCE
+
+extern boolean_t task_is_importance_donor(task_t task);
+extern boolean_t task_is_marked_importance_donor(task_t task);
+extern boolean_t task_is_marked_live_importance_donor(task_t task);
+
+extern boolean_t task_is_importance_receiver(task_t task);
+extern boolean_t task_is_marked_importance_receiver(task_t task);
+
+extern boolean_t task_is_importance_denap_receiver(task_t task);
+extern boolean_t task_is_marked_importance_denap_receiver(task_t task);
+
+extern boolean_t task_is_importance_receiver_type(task_t task);
+
+extern int task_importance_hold_watchport_assertion(task_t target_task, uint32_t count);
+extern int task_importance_hold_internal_assertion(task_t target_task, uint32_t count);
+extern int task_importance_drop_internal_assertion(task_t target_task, uint32_t count);
+
+extern int task_importance_hold_file_lock_assertion(task_t target_task, uint32_t count);
+extern int task_importance_drop_file_lock_assertion(task_t target_task, uint32_t count);
+
+extern int task_importance_hold_legacy_external_assertion(task_t target_task, uint32_t count);
+extern int task_importance_drop_legacy_external_assertion(task_t target_task, uint32_t count);
+
+#endif /* IMPORTANCE_INHERITANCE */
+
+extern boolean_t task_has_been_notified(task_t task, int pressurelevel);
+extern boolean_t task_used_for_purging(task_t task, int pressurelevel);
+extern void task_mark_has_been_notified(task_t task, int pressurelevel);
+extern void task_mark_used_for_purging(task_t task, int pressurelevel);
+extern void task_clear_has_been_notified(task_t task, int pressurelevel);
+extern void task_clear_used_for_purging(task_t task);
+extern int task_importance_estimate(task_t task);
+
+/*
+ * This should only be used for debugging.
+ * pid is stored in audit_token by set_security_token().
+ */
+#define audit_token_pid_from_task(task)  ((task)->audit_token.val[5])
+
+/* End task_policy */
+
+extern kern_return_t task_purge_volatile_memory(task_t task);
+
+extern void      task_set_gpu_denied(task_t task, boolean_t denied);
+extern boolean_t task_is_gpu_denied(task_t task);
 
 #endif	/* XNU_KERNEL_PRIVATE */
 
@@ -668,9 +815,13 @@ extern boolean_t get_task_frozen(task_t);
 
 /* Convert from a task to a port */
 extern ipc_port_t convert_task_to_port(task_t);
-
-/* Convert from a task name to a port */
 extern ipc_port_t convert_task_name_to_port(task_name_t);
+extern ipc_port_t convert_task_suspension_token_to_port(task_suspension_token_t task);
+
+/* Convert from a port (in this case, an SO right to a task's resume port) to a task. */
+extern task_suspension_token_t convert_port_to_task_suspension_token(ipc_port_t port);
+
+extern boolean_t task_suspension_notify(mach_msg_header_t *);
 
 #endif	/* KERNEL_PRIVATE */
 
@@ -681,6 +832,9 @@ extern void		task_deallocate(
 
 extern void		task_name_deallocate(
 					task_name_t		task_name);
+
+extern void		task_suspension_token_deallocate(
+					task_suspension_token_t	token);
 __END_DECLS
 
 #endif	/* _KERN_TASK_H_ */

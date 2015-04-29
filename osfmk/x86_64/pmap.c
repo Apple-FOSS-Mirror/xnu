@@ -102,7 +102,6 @@
 #include <kern/ledger.h>
 #include <kern/mach_param.h>
 
-#include <kern/lock.h>
 #include <kern/kalloc.h>
 #include <kern/spl.h>
 
@@ -174,13 +173,15 @@ uint64_t max_preemption_latency_tsc = 0;
 
 pv_hashed_entry_t     *pv_hash_table;  /* hash lists */
 
-uint32_t npvhash = 0;
+uint32_t npvhashmask = 0, npvhashbuckets = 0;
 
 pv_hashed_entry_t	pv_hashed_free_list = PV_HASHED_ENTRY_NULL;
 pv_hashed_entry_t	pv_hashed_kern_free_list = PV_HASHED_ENTRY_NULL;
 decl_simple_lock_data(,pv_hashed_free_list_lock)
 decl_simple_lock_data(,pv_hashed_kern_free_list_lock)
 decl_simple_lock_data(,pv_hash_table_lock)
+
+decl_simple_lock_data(,phys_backup_lock)
 
 zone_t		pv_hashed_list_zone;	/* zone of pv_hashed_entry structures */
 
@@ -291,10 +292,12 @@ extern  vm_offset_t		sconstdata, econstdata;
 extern void			*KPTphys;
 
 boolean_t pmap_smep_enabled = FALSE;
+boolean_t pmap_smap_enabled = FALSE;
 
 void
 pmap_cpu_init(void)
 {
+	cpu_data_t	*cdp = current_cpu_datap();
 	/*
 	 * Here early in the life of a processor (from cpu_mode_init()).
 	 * Ensure global page feature is disabled at this point.
@@ -305,10 +308,10 @@ pmap_cpu_init(void)
 	/*
 	 * Initialize the per-cpu, TLB-related fields.
 	 */
-	current_cpu_datap()->cpu_kernel_cr3 = kernel_pmap->pm_cr3;
-	current_cpu_datap()->cpu_active_cr3 = kernel_pmap->pm_cr3;
-	current_cpu_datap()->cpu_tlb_invalid = FALSE;
-	current_cpu_datap()->cpu_task_map = TASK_MAP_64BIT;
+	cdp->cpu_kernel_cr3 = kernel_pmap->pm_cr3;
+	cdp->cpu_active_cr3 = kernel_pmap->pm_cr3;
+	cdp->cpu_tlb_invalid = FALSE;
+	cdp->cpu_task_map = TASK_MAP_64BIT;
 	pmap_pcid_configure();
 	if (cpuid_leaf7_features() & CPUID_LEAF7_FEATURE_SMEP) {
 		boolean_t nsmep;
@@ -317,9 +320,25 @@ pmap_cpu_init(void)
 			pmap_smep_enabled = TRUE;
 		}
 	}
+
+	if (cdp->cpu_fixed_pmcs_enabled) {
+		boolean_t enable = TRUE;
+		cpu_pmc_control(&enable);
+	}
 }
 
+static uint32_t pmap_scale_shift(void) {
+	uint32_t scale = 0;
 
+	if (sane_size <= 8*GB) {
+		scale = (uint32_t)(sane_size / (2 * GB));
+	} else if (sane_size <= 32*GB) {
+		scale = 4 + (uint32_t)((sane_size - (8 * GB))/ (4 * GB)); 
+	} else {
+		scale = 10 + (uint32_t)MIN(4, ((sane_size - (32 * GB))/ (8 * GB))); 
+	}
+	return scale;
+}
 
 /*
  *	Bootstrap the system enough to run with virtual memory.
@@ -404,21 +423,23 @@ pmap_bootstrap(
 
 	virtual_avail = va;
 #endif
+	if (!PE_parse_boot_argn("npvhash", &npvhashmask, sizeof (npvhashmask))) {
+		npvhashmask = ((NPVHASHBUCKETS) << pmap_scale_shift()) - 1;
 
-	if (PE_parse_boot_argn("npvhash", &npvhash, sizeof (npvhash))) {
-		if (0 != ((npvhash + 1) & npvhash)) {
-			kprintf("invalid hash %d, must be ((2^N)-1), "
-				"using default %d\n", npvhash, NPVHASH);
-			npvhash = NPVHASH;
-		}
-	} else {
-		npvhash = NPVHASH;
+	}
+
+	npvhashbuckets = npvhashmask + 1;
+
+	if (0 != ((npvhashbuckets) & npvhashmask)) {
+		panic("invalid hash %d, must be ((2^N)-1), "
+		    "using default %d\n", npvhashmask, NPVHASHMASK);
 	}
 
 	simple_lock_init(&kernel_pmap->lock, 0);
 	simple_lock_init(&pv_hashed_free_list_lock, 0);
 	simple_lock_init(&pv_hashed_kern_free_list_lock, 0);
 	simple_lock_init(&pv_hash_table_lock,0);
+	simple_lock_init(&phys_backup_lock, 0);
 
 	pmap_cpu_init();
 
@@ -430,7 +451,7 @@ pmap_bootstrap(
 
 #if	DEBUG
 	printf("Stack canary: 0x%lx\n", __stack_chk_guard[0]);
-	printf("ml_early_random(): 0x%qx\n", ml_early_random());
+	printf("early_random(): 0x%qx\n", early_random());
 #endif
 	boolean_t ptmp;
 	/* Check if the user has requested disabling stack or heap no-execute
@@ -487,6 +508,131 @@ pmap_virtual_space(
 	*endp = virtual_end;
 }
 
+
+
+
+#if HIBERNATION
+
+#include <IOKit/IOHibernatePrivate.h>
+
+int32_t		pmap_npages;
+int32_t		pmap_teardown_last_valid_compact_indx = -1;
+
+
+void	hibernate_rebuild_pmap_structs(void);
+void	hibernate_teardown_pmap_structs(addr64_t *, addr64_t *);
+void	pmap_pack_index(uint32_t);
+int32_t	pmap_unpack_index(pv_rooted_entry_t);
+
+
+int32_t
+pmap_unpack_index(pv_rooted_entry_t pv_h)
+{
+	int32_t	indx = 0;
+
+	indx = (int32_t)(*((uint64_t *)(&pv_h->qlink.next)) >> 48);
+	indx = indx << 16;
+	indx |= (int32_t)(*((uint64_t *)(&pv_h->qlink.prev)) >> 48);
+	
+	*((uint64_t *)(&pv_h->qlink.next)) |= ((uint64_t)0xffff << 48);
+	*((uint64_t *)(&pv_h->qlink.prev)) |= ((uint64_t)0xffff << 48);
+
+	return (indx);
+}
+
+
+void
+pmap_pack_index(uint32_t indx)
+{
+	pv_rooted_entry_t	pv_h;
+
+	pv_h = &pv_head_table[indx];
+
+	*((uint64_t *)(&pv_h->qlink.next)) &= ~((uint64_t)0xffff << 48);
+	*((uint64_t *)(&pv_h->qlink.prev)) &= ~((uint64_t)0xffff << 48);
+
+	*((uint64_t *)(&pv_h->qlink.next)) |= ((uint64_t)(indx >> 16)) << 48;
+	*((uint64_t *)(&pv_h->qlink.prev)) |= ((uint64_t)(indx & 0xffff)) << 48;
+}
+
+
+void
+hibernate_teardown_pmap_structs(addr64_t *unneeded_start, addr64_t *unneeded_end)
+{
+	int32_t		i;
+	int32_t		compact_target_indx;
+
+	compact_target_indx = 0;
+
+	for (i = 0; i < pmap_npages; i++) {
+		if (pv_head_table[i].pmap == PMAP_NULL) {
+
+			if (pv_head_table[compact_target_indx].pmap != PMAP_NULL)
+				compact_target_indx = i;
+		} else {
+			pmap_pack_index((uint32_t)i);
+
+			if (pv_head_table[compact_target_indx].pmap == PMAP_NULL) {
+				/*
+                                 * we've got a hole to fill, so
+                                 * move this pv_rooted_entry_t to it's new home
+                                 */
+				pv_head_table[compact_target_indx] = pv_head_table[i];
+				pv_head_table[i].pmap = PMAP_NULL;
+				
+				pmap_teardown_last_valid_compact_indx = compact_target_indx;
+				compact_target_indx++;
+			} else
+				pmap_teardown_last_valid_compact_indx = i;
+		}
+	}
+	*unneeded_start = (addr64_t)&pv_head_table[pmap_teardown_last_valid_compact_indx+1];
+	*unneeded_end = (addr64_t)&pv_head_table[pmap_npages-1];
+	
+	HIBLOG("hibernate_teardown_pmap_structs done: last_valid_compact_indx %d\n", pmap_teardown_last_valid_compact_indx);
+}
+
+
+void
+hibernate_rebuild_pmap_structs(void)
+{
+	int32_t			cindx, eindx, rindx;
+	pv_rooted_entry_t	pv_h;
+
+	eindx = (int32_t)pmap_npages;
+
+	for (cindx = pmap_teardown_last_valid_compact_indx; cindx >= 0; cindx--) {
+
+		pv_h = &pv_head_table[cindx];
+
+		rindx = pmap_unpack_index(pv_h);
+		assert(rindx < pmap_npages);
+
+		if (rindx != cindx) {
+			/*
+			 * this pv_rooted_entry_t was moved by hibernate_teardown_pmap_structs,
+			 * so move it back to its real location
+			 */
+			pv_head_table[rindx] = pv_head_table[cindx];
+		}
+		if (rindx+1 != eindx) {
+			/*
+			 * the 'hole' between this vm_rooted_entry_t and the previous
+			 * vm_rooted_entry_t we moved needs to be initialized as 
+			 * a range of zero'd vm_rooted_entry_t's
+			 */
+			bzero((char *)&pv_head_table[rindx+1], (eindx - rindx - 1) * sizeof (struct pv_rooted_entry));
+		}
+		eindx = rindx;
+	}
+	if (rindx)
+		bzero ((char *)&pv_head_table[0], rindx * sizeof (struct pv_rooted_entry));
+
+	HIBLOG("hibernate_rebuild_pmap_structs done: last_valid_compact_indx %d\n", pmap_teardown_last_valid_compact_indx);
+}
+
+#endif
+
 /*
  *	Initialize the pmap module.
  *	Called by vm_init, to initialize any structures that the pmap
@@ -503,13 +649,13 @@ pmap_init(void)
 
 
 	kernel_pmap->pm_obj_pml4 = &kpml4obj_object_store;
-	_vm_object_allocate((vm_object_size_t)NPML4PGS, &kpml4obj_object_store);
+	_vm_object_allocate((vm_object_size_t)NPML4PGS * PAGE_SIZE, &kpml4obj_object_store);
 
 	kernel_pmap->pm_obj_pdpt = &kpdptobj_object_store;
-	_vm_object_allocate((vm_object_size_t)NPDPTPGS, &kpdptobj_object_store);
+	_vm_object_allocate((vm_object_size_t)NPDPTPGS * PAGE_SIZE, &kpdptobj_object_store);
 
 	kernel_pmap->pm_obj = &kptobj_object_store;
-	_vm_object_allocate((vm_object_size_t)NPDEPGS, &kptobj_object_store);
+	_vm_object_allocate((vm_object_size_t)NPDEPGS * PAGE_SIZE, &kptobj_object_store);
 
 	/*
 	 *	Allocate memory for the pv_head_table and its lock bits,
@@ -522,10 +668,13 @@ pmap_init(void)
 	 */
 
 	npages = i386_btop(avail_end);
+#if HIBERNATION
+	pmap_npages = (uint32_t)npages;
+#endif	
 	s = (vm_size_t) (sizeof(struct pv_rooted_entry) * npages
-			 + (sizeof (struct pv_hashed_entry_t *) * (npvhash+1))
+			 + (sizeof (struct pv_hashed_entry_t *) * (npvhashbuckets))
 			 + pv_lock_table_size(npages)
-			 + pv_hash_lock_table_size((npvhash+1))
+			 + pv_hash_lock_table_size((npvhashbuckets))
 				+ npages);
 
 	s = round_page(s);
@@ -540,7 +689,7 @@ pmap_init(void)
 	vsize = s;
 
 #if PV_DEBUG
-	if (0 == npvhash) panic("npvhash not initialized");
+	if (0 == npvhashmask) panic("npvhashmask not initialized");
 #endif
 
 	/*
@@ -550,13 +699,13 @@ pmap_init(void)
 	addr = (vm_offset_t) (pv_head_table + npages);
 
 	pv_hash_table = (pv_hashed_entry_t *)addr;
-	addr = (vm_offset_t) (pv_hash_table + (npvhash + 1));
+	addr = (vm_offset_t) (pv_hash_table + (npvhashbuckets));
 
 	pv_lock_table = (char *) addr;
 	addr = (vm_offset_t) (pv_lock_table + pv_lock_table_size(npages));
 
 	pv_hash_lock_table = (char *) addr;
-	addr = (vm_offset_t) (pv_hash_lock_table + pv_hash_lock_table_size((npvhash+1)));
+	addr = (vm_offset_t) (pv_hash_lock_table + pv_hash_lock_table_size((npvhashbuckets)));
 
 	pmap_phys_attributes = (char *) addr;
 
@@ -777,7 +926,10 @@ pmap_lowmem_finalize(void)
 	 */
 	DPRINTF("%s: Removing mappings from 0->0x%lx\n", __FUNCTION__, vm_kernel_base);
 
-	/* Remove all mappings past the descriptor aliases and low globals */
+	/*
+	 * Remove all mappings past the boot-cpu descriptor aliases and low globals.
+	 * Non-boot-cpu GDT aliases will be remapped later as needed. 
+	 */
 	pmap_remove(kernel_pmap, LOWGLOBAL_ALIAS + PAGE_SIZE, vm_kernel_base);
 
 	/*
@@ -1085,9 +1237,13 @@ pmap_create(
 	bzero(p, sizeof(*p));
 	/* init counts now since we'll be bumping some */
 	simple_lock_init(&p->lock, 0);
+#if 00
 	p->stats.resident_count = 0;
 	p->stats.resident_max = 0;
 	p->stats.wired_count = 0;
+#else
+	bzero(&p->stats, sizeof (p->stats));
+#endif
 	p->ref_count = 1;
 	p->nx_enabled = 1;
 	p->pm_shared = FALSE;
@@ -1108,15 +1264,15 @@ pmap_create(
 
 	/* allocate the vm_objs to hold the pdpt, pde and pte pages */
 
-	p->pm_obj_pml4 = vm_object_allocate((vm_object_size_t)(NPML4PGS));
+	p->pm_obj_pml4 = vm_object_allocate((vm_object_size_t)(NPML4PGS) * PAGE_SIZE);
 	if (NULL == p->pm_obj_pml4)
 		panic("pmap_create pdpt obj");
 
-	p->pm_obj_pdpt = vm_object_allocate((vm_object_size_t)(NPDPTPGS));
+	p->pm_obj_pdpt = vm_object_allocate((vm_object_size_t)(NPDPTPGS) * PAGE_SIZE);
 	if (NULL == p->pm_obj_pdpt)
 		panic("pmap_create pdpt obj");
 
-	p->pm_obj = vm_object_allocate((vm_object_size_t)(NPDEPGS));
+	p->pm_obj = vm_object_allocate((vm_object_size_t)(NPDEPGS) * PAGE_SIZE);
 	if (NULL == p->pm_obj)
 		panic("pmap_create pte obj");
 
@@ -1231,17 +1387,31 @@ pmap_remove_some_phys(
 
 }
 
-/*
- *	Set the physical protection on the
- *	specified range of this map as requested.
- *	Will not increase permissions.
- */
+
 void
 pmap_protect(
 	pmap_t		map,
 	vm_map_offset_t	sva,
 	vm_map_offset_t	eva,
 	vm_prot_t	prot)
+{
+	pmap_protect_options(map, sva, eva, prot, 0, NULL);
+}
+
+
+/*
+ *	Set the physical protection on the
+ *	specified range of this map as requested.
+ *	Will not increase permissions.
+ */
+void
+pmap_protect_options(
+	pmap_t		map,
+	vm_map_offset_t	sva,
+	vm_map_offset_t	eva,
+	vm_prot_t	prot,
+	unsigned int	options,
+	void		*arg)
 {
 	pt_entry_t	*pde;
 	pt_entry_t	*spte, *epte;
@@ -1256,7 +1426,7 @@ pmap_protect(
 		return;
 
 	if (prot == VM_PROT_NONE) {
-		pmap_remove(map, sva, eva);
+		pmap_remove_options(map, sva, eva, options);
 		return;
 	}
 	PMAP_TRACE(PMAP_CODE(PMAP__PROTECT) | DBG_FUNC_START,
@@ -1306,9 +1476,12 @@ pmap_protect(
 		}
 		sva = lva;
 	}
-	if (num_found)
-		PMAP_UPDATE_TLBS(map, orig_sva, eva);
-
+	if (num_found) {
+		if (options & PMAP_OPTIONS_NOFLUSH)
+			PMAP_UPDATE_TLBS_DELAYED(map, orig_sva, eva, (pmap_flush_context *)arg);
+		else
+			PMAP_UPDATE_TLBS(map, orig_sva, eva);
+	}
 	PMAP_UNLOCK(map);
 
 	PMAP_TRACE(PMAP_CODE(PMAP__PROTECT) | DBG_FUNC_END,
@@ -1404,12 +1577,12 @@ pmap_expand_pml4(
 	}
 
 #if 0 /* DEBUG */
-       if (0 != vm_page_lookup(map->pm_obj_pml4, (vm_object_offset_t)i)) {
+       if (0 != vm_page_lookup(map->pm_obj_pml4, (vm_object_offset_t)i * PAGE_SIZE)) {
 	       panic("pmap_expand_pml4: obj not empty, pmap %p pm_obj %p vaddr 0x%llx i 0x%llx\n",
 		     map, map->pm_obj_pml4, vaddr, i);
        }
 #endif
-	vm_page_insert(m, map->pm_obj_pml4, (vm_object_offset_t)i);
+	vm_page_insert(m, map->pm_obj_pml4, (vm_object_offset_t)i * PAGE_SIZE);
 	vm_object_unlock(map->pm_obj_pml4);
 
 	/*
@@ -1493,12 +1666,12 @@ pmap_expand_pdpt(pmap_t map, vm_map_offset_t vaddr, unsigned int options)
 	}
 
 #if 0 /* DEBUG */
-       if (0 != vm_page_lookup(map->pm_obj_pdpt, (vm_object_offset_t)i)) {
+       if (0 != vm_page_lookup(map->pm_obj_pdpt, (vm_object_offset_t)i * PAGE_SIZE)) {
 	       panic("pmap_expand_pdpt: obj not empty, pmap %p pm_obj %p vaddr 0x%llx i 0x%llx\n",
 		     map, map->pm_obj_pdpt, vaddr, i);
        }
 #endif
-	vm_page_insert(m, map->pm_obj_pdpt, (vm_object_offset_t)i);
+	vm_page_insert(m, map->pm_obj_pdpt, (vm_object_offset_t)i * PAGE_SIZE);
 	vm_object_unlock(map->pm_obj_pdpt);
 
 	/*
@@ -1613,12 +1786,12 @@ pmap_expand(
 	}
 
 #if 0 /* DEBUG */
-       if (0 != vm_page_lookup(map->pm_obj, (vm_object_offset_t)i)) {
+       if (0 != vm_page_lookup(map->pm_obj, (vm_object_offset_t)i * PAGE_SIZE)) {
 	       panic("pmap_expand: obj not empty, pmap 0x%x pm_obj 0x%x vaddr 0x%llx i 0x%llx\n",
 		     map, map->pm_obj, vaddr, i);
        }
 #endif
-	vm_page_insert(m, map->pm_obj, (vm_object_offset_t)i);
+	vm_page_insert(m, map->pm_obj, (vm_object_offset_t)i * PAGE_SIZE);
 	vm_object_unlock(map->pm_obj);
 
 	/*
@@ -1805,7 +1978,7 @@ pmap_collect(
 
 			vm_object_lock(p->pm_obj);
 
-			m = vm_page_lookup(p->pm_obj,(vm_object_offset_t)(pdp - (pt_entry_t *)&p->dirbase[0]));
+			m = vm_page_lookup(p->pm_obj,(vm_object_offset_t)(pdp - (pt_entry_t *)&p->dirbase[0]) * PAGE_SIZE);
 			if (m == VM_PAGE_NULL)
 			    panic("pmap_collect: pte page not in object");
 
@@ -1893,14 +2066,11 @@ kern_return_t dtrace_copyio_preflight(__unused addr64_t va)
 {
 	thread_t thread = current_thread();
 	uint64_t ccr3;
-
 	if (current_map() == kernel_map)
 		return KERN_FAILURE;
 	else if (((ccr3 = get_cr3_base()) != thread->map->pmap->pm_cr3) && (no_shared_cr3 == FALSE))
 		return KERN_FAILURE;
 	else if (no_shared_cr3 && (ccr3 != kernel_pmap->pm_cr3))
-		return KERN_FAILURE;
-	else if (thread->machine.specFlags & CopyIOActive)
 		return KERN_FAILURE;
 	else
 		return KERN_SUCCESS;
@@ -1970,7 +2140,7 @@ pmap_switch(pmap_t tpmap)
         spl_t	s;
 
 	s = splhigh();		/* Make sure interruptions are disabled */
-	set_dirbase(tpmap, current_thread());
+	set_dirbase(tpmap, current_thread(), cpu_number());
 	splx(s);
 }
 
@@ -2018,123 +2188,76 @@ pt_fake_zone_info(
 	*caller_acct = 1;
 }
 
-static inline void
-pmap_cpuset_NMIPI(cpu_set cpu_mask) {
-	unsigned int cpu, cpu_bit;
-	uint64_t deadline;
-
-	for (cpu = 0, cpu_bit = 1; cpu < real_ncpus; cpu++, cpu_bit <<= 1) {
-		if (cpu_mask & cpu_bit)
-			cpu_NMI_interrupt(cpu);
-	}
-	deadline = mach_absolute_time() + (LockTimeOut);
-	while (mach_absolute_time() < deadline)
-		cpu_pause();
-}
-
-/*
- * Called with pmap locked, we:
- *  - scan through per-cpu data to see which other cpus need to flush
- *  - send an IPI to each non-idle cpu to be flushed
- *  - wait for all to signal back that they are inactive or we see that
- *    they are at a safe point (idle).
- *  - flush the local tlb if active for this pmap
- *  - return ... the caller will unlock the pmap
- */
 
 void
-pmap_flush_tlbs(pmap_t	pmap, vm_map_offset_t startv, vm_map_offset_t endv)
+pmap_flush_context_init(pmap_flush_context *pfc)
 {
+	pfc->pfc_cpus = 0;
+	pfc->pfc_invalid_global = 0;
+}
+
+extern unsigned TLBTimeOut;
+void
+pmap_flush(
+	pmap_flush_context *pfc)
+{
+	unsigned int	my_cpu;
 	unsigned int	cpu;
 	unsigned int	cpu_bit;
-	cpu_set		cpus_to_signal;
-	unsigned int	my_cpu = cpu_number();
-	pmap_paddr_t	pmap_cr3 = pmap->pm_cr3;
+	cpumask_t	cpus_to_respond = 0;
+	cpumask_t	cpus_to_signal = 0;
+	cpumask_t	cpus_signaled = 0;
 	boolean_t	flush_self = FALSE;
 	uint64_t	deadline;
-	boolean_t	pmap_is_shared = (pmap->pm_shared || (pmap == kernel_pmap));
 
-	assert((processor_avail_count < 2) ||
-	       (ml_get_interrupts_enabled() && get_preemption_level() != 0));
+	mp_disable_preemption();
 
-	/*
-	 * Scan other cpus for matching active or task CR3.
-	 * For idle cpus (with no active map) we mark them invalid but
-	 * don't signal -- they'll check as they go busy.
-	 */
-	cpus_to_signal = 0;
+	my_cpu = cpu_number();
+	cpus_to_signal = pfc->pfc_cpus;
 
-	if (pmap_pcid_ncpus) {
-		pmap_pcid_invalidate_all_cpus(pmap);
-		__asm__ volatile("mfence":::"memory");
-	}
+	PMAP_TRACE_CONSTANT(PMAP_CODE(PMAP__FLUSH_DELAYED_TLBS) | DBG_FUNC_START,
+			    NULL, cpus_to_signal, 0, 0, 0);
 
-	for (cpu = 0, cpu_bit = 1; cpu < real_ncpus; cpu++, cpu_bit <<= 1) {
-		if (!cpu_datap(cpu)->cpu_running)
-			continue;
-		uint64_t	cpu_active_cr3 = CPU_GET_ACTIVE_CR3(cpu);
-		uint64_t	cpu_task_cr3 = CPU_GET_TASK_CR3(cpu);
+	for (cpu = 0, cpu_bit = 1; cpu < real_ncpus && cpus_to_signal; cpu++, cpu_bit <<= 1) {
 
-		if ((pmap_cr3 == cpu_task_cr3) ||
-		    (pmap_cr3 == cpu_active_cr3) ||
-		    (pmap_is_shared)) {
+		if (cpus_to_signal & cpu_bit) {
+
+			cpus_to_signal &= ~cpu_bit;
+
+			if (!cpu_datap(cpu)->cpu_running)
+				continue;
+
+			if (pfc->pfc_invalid_global & cpu_bit)
+				cpu_datap(cpu)->cpu_tlb_invalid_global = TRUE;
+			else
+				cpu_datap(cpu)->cpu_tlb_invalid_local = TRUE;
+			mfence();
+
 			if (cpu == my_cpu) {
 				flush_self = TRUE;
 				continue;
 			}
-			if (pmap_pcid_ncpus && pmap_is_shared)
-				cpu_datap(cpu)->cpu_tlb_invalid_global = TRUE;
-			else
-				cpu_datap(cpu)->cpu_tlb_invalid_local = TRUE;
-			__asm__ volatile("mfence":::"memory");
-
-			/*
-			 * We don't need to signal processors which will flush
-			 * lazily at the idle state or kernel boundary.
-			 * For example, if we're invalidating the kernel pmap,
-			 * processors currently in userspace don't need to flush
-			 * their TLBs until the next time they enter the kernel.
-			 * Alterations to the address space of a task active
-			 * on a remote processor result in a signal, to
-			 * account for copy operations. (There may be room
-			 * for optimization in such cases).
-			 * The order of the loads below with respect
-			 * to the store to the "cpu_tlb_invalid" field above
-			 * is important--hence the barrier.
-			 */
-			if (CPU_CR3_IS_ACTIVE(cpu) &&
-			    (pmap_cr3 == CPU_GET_ACTIVE_CR3(cpu) ||
-			    pmap->pm_shared ||
-			    (pmap_cr3 == CPU_GET_TASK_CR3(cpu)))) {
-				cpus_to_signal |= cpu_bit;
+			if (CPU_CR3_IS_ACTIVE(cpu)) {
+				cpus_to_respond |= cpu_bit;
 				i386_signal_cpu(cpu, MP_TLB_FLUSH, ASYNC);
 			}
 		}
 	}
-
-	PMAP_TRACE_CONSTANT(PMAP_CODE(PMAP__FLUSH_TLBS) | DBG_FUNC_START,
-		   pmap, cpus_to_signal, flush_self, startv, endv);
+	cpus_signaled = cpus_to_respond;
 
 	/*
 	 * Flush local tlb if required.
 	 * Do this now to overlap with other processors responding.
 	 */
-	if (flush_self) {
-		if (pmap_pcid_ncpus) {
-			pmap_pcid_validate_cpu(pmap, my_cpu);
-			if (pmap_is_shared)
-				tlb_flush_global();
-			else
-				flush_tlb_raw();
-		}
-		else
-			flush_tlb_raw();
-	}
+	if (flush_self && cpu_datap(my_cpu)->cpu_tlb_invalid != FALSE)
+		process_pmap_updates();
 
-	if (cpus_to_signal) {
-		cpu_set	cpus_to_respond = cpus_to_signal;
+	if (cpus_to_respond) {
 
-		deadline = mach_absolute_time() + LockTimeOut;
+		deadline = mach_absolute_time() +
+				(TLBTimeOut ? TLBTimeOut : LockTimeOut);
+		boolean_t is_timeout_traced = FALSE;
+		
 		/*
 		 * Wait for those other cpus to acknowledge
 		 */
@@ -2159,9 +2282,189 @@ pmap_flush_tlbs(pmap_t	pmap, vm_map_offset_t startv, vm_map_offset_t endv)
 			if (cpus_to_respond && (mach_absolute_time() > deadline)) {
 				if (machine_timeout_suspended())
 					continue;
+				if (TLBTimeOut == 0) {
+					if (is_timeout_traced)
+						continue;
+					PMAP_TRACE_CONSTANT(PMAP_CODE(PMAP__FLUSH_TLBS_TO),
+			    			NULL, cpus_to_signal, cpus_to_respond, 0, 0);
+					is_timeout_traced = TRUE;
+					continue;
+				}
 				pmap_tlb_flush_timeout = TRUE;
 				orig_acks = NMIPI_acks;
-				pmap_cpuset_NMIPI(cpus_to_respond);
+				mp_cpus_NMIPI(cpus_to_respond);
+
+				panic("TLB invalidation IPI timeout: "
+				    "CPU(s) failed to respond to interrupts, unresponsive CPU bitmap: 0x%lx, NMIPI acks: orig: 0x%lx, now: 0x%lx",
+				    cpus_to_respond, orig_acks, NMIPI_acks);
+			}
+		}
+	}
+	PMAP_TRACE_CONSTANT(PMAP_CODE(PMAP__FLUSH_DELAYED_TLBS) | DBG_FUNC_END,
+			    NULL, cpus_signaled, flush_self, 0, 0);
+
+	mp_enable_preemption();
+}
+
+
+/*
+ * Called with pmap locked, we:
+ *  - scan through per-cpu data to see which other cpus need to flush
+ *  - send an IPI to each non-idle cpu to be flushed
+ *  - wait for all to signal back that they are inactive or we see that
+ *    they are at a safe point (idle).
+ *  - flush the local tlb if active for this pmap
+ *  - return ... the caller will unlock the pmap
+ */
+
+void
+pmap_flush_tlbs(pmap_t	pmap, vm_map_offset_t startv, vm_map_offset_t endv, int options, pmap_flush_context *pfc)
+{
+	unsigned int	cpu;
+	unsigned int	cpu_bit;
+	cpumask_t	cpus_to_signal;
+	unsigned int	my_cpu = cpu_number();
+	pmap_paddr_t	pmap_cr3 = pmap->pm_cr3;
+	boolean_t	flush_self = FALSE;
+	uint64_t	deadline;
+	boolean_t	pmap_is_shared = (pmap->pm_shared || (pmap == kernel_pmap));
+	boolean_t	need_global_flush = FALSE;
+	uint32_t	event_code;
+
+	assert((processor_avail_count < 2) ||
+	       (ml_get_interrupts_enabled() && get_preemption_level() != 0));
+
+	event_code = (pmap == kernel_pmap) ? PMAP_CODE(PMAP__FLUSH_KERN_TLBS)
+					   : PMAP_CODE(PMAP__FLUSH_TLBS);
+	PMAP_TRACE_CONSTANT(event_code | DBG_FUNC_START,
+			    pmap, options, startv, endv, 0);
+
+	/*
+	 * Scan other cpus for matching active or task CR3.
+	 * For idle cpus (with no active map) we mark them invalid but
+	 * don't signal -- they'll check as they go busy.
+	 */
+	cpus_to_signal = 0;
+
+	if (pmap_pcid_ncpus) {
+		if (pmap_is_shared)
+			need_global_flush = TRUE;
+		pmap_pcid_invalidate_all_cpus(pmap);
+		mfence();
+	}
+	for (cpu = 0, cpu_bit = 1; cpu < real_ncpus; cpu++, cpu_bit <<= 1) {
+		if (!cpu_datap(cpu)->cpu_running)
+			continue;
+		uint64_t	cpu_active_cr3 = CPU_GET_ACTIVE_CR3(cpu);
+		uint64_t	cpu_task_cr3 = CPU_GET_TASK_CR3(cpu);
+
+		if ((pmap_cr3 == cpu_task_cr3) ||
+		    (pmap_cr3 == cpu_active_cr3) ||
+		    (pmap_is_shared)) {
+
+			if (options & PMAP_DELAY_TLB_FLUSH) {
+				if (need_global_flush == TRUE)
+					pfc->pfc_invalid_global |= cpu_bit;
+				pfc->pfc_cpus |= cpu_bit;
+
+				continue;
+			}
+			if (cpu == my_cpu) {
+				flush_self = TRUE;
+				continue;
+			}
+			if (need_global_flush == TRUE)
+				cpu_datap(cpu)->cpu_tlb_invalid_global = TRUE;
+			else
+				cpu_datap(cpu)->cpu_tlb_invalid_local = TRUE;
+			mfence();
+
+			/*
+			 * We don't need to signal processors which will flush
+			 * lazily at the idle state or kernel boundary.
+			 * For example, if we're invalidating the kernel pmap,
+			 * processors currently in userspace don't need to flush
+			 * their TLBs until the next time they enter the kernel.
+			 * Alterations to the address space of a task active
+			 * on a remote processor result in a signal, to
+			 * account for copy operations. (There may be room
+			 * for optimization in such cases).
+			 * The order of the loads below with respect
+			 * to the store to the "cpu_tlb_invalid" field above
+			 * is important--hence the barrier.
+			 */
+			if (CPU_CR3_IS_ACTIVE(cpu) &&
+			    (pmap_cr3 == CPU_GET_ACTIVE_CR3(cpu) ||
+			     pmap->pm_shared ||
+			     (pmap_cr3 == CPU_GET_TASK_CR3(cpu)))) {
+				cpus_to_signal |= cpu_bit;
+				i386_signal_cpu(cpu, MP_TLB_FLUSH, ASYNC);
+			}
+		}
+	}
+	if ((options & PMAP_DELAY_TLB_FLUSH))
+		goto out;
+
+	/*
+	 * Flush local tlb if required.
+	 * Do this now to overlap with other processors responding.
+	 */
+	if (flush_self) {
+		if (pmap_pcid_ncpus) {
+			pmap_pcid_validate_cpu(pmap, my_cpu);
+			if (pmap_is_shared)
+				tlb_flush_global();
+			else
+				flush_tlb_raw();
+		}
+		else
+			flush_tlb_raw();
+	}
+
+	if (cpus_to_signal) {
+		cpumask_t	cpus_to_respond = cpus_to_signal;
+
+		deadline = mach_absolute_time() +
+				(TLBTimeOut ? TLBTimeOut : LockTimeOut);
+		boolean_t is_timeout_traced = FALSE;
+
+		/*
+		 * Wait for those other cpus to acknowledge
+		 */
+		while (cpus_to_respond != 0) {
+			long orig_acks = 0;
+
+			for (cpu = 0, cpu_bit = 1; cpu < real_ncpus; cpu++, cpu_bit <<= 1) {
+				/* Consider checking local/global invalidity
+				 * as appropriate in the PCID case.
+				 */
+				if ((cpus_to_respond & cpu_bit) != 0) {
+					if (!cpu_datap(cpu)->cpu_running ||
+					    cpu_datap(cpu)->cpu_tlb_invalid == FALSE ||
+					    !CPU_CR3_IS_ACTIVE(cpu)) {
+						cpus_to_respond &= ~cpu_bit;
+					}
+					cpu_pause();
+				}
+				if (cpus_to_respond == 0)
+					break;
+			}
+			if (cpus_to_respond && (mach_absolute_time() > deadline)) {
+				if (machine_timeout_suspended())
+					continue;
+				if (TLBTimeOut == 0) {
+					/* cut tracepoint but don't panic */
+					if (is_timeout_traced)
+						continue;
+					PMAP_TRACE_CONSTANT(
+						PMAP_CODE(PMAP__FLUSH_TLBS_TO),
+				    		pmap, cpus_to_signal, cpus_to_respond, 0, 0);
+					is_timeout_traced = TRUE;
+					continue;
+				}
+				pmap_tlb_flush_timeout = TRUE;
+				orig_acks = NMIPI_acks;
+				mp_cpus_NMIPI(cpus_to_respond);
 
 				panic("TLB invalidation IPI timeout: "
 				    "CPU(s) failed to respond to interrupts, unresponsive CPU bitmap: 0x%lx, NMIPI acks: orig: 0x%lx, now: 0x%lx",
@@ -2171,11 +2474,13 @@ pmap_flush_tlbs(pmap_t	pmap, vm_map_offset_t startv, vm_map_offset_t endv)
 	}
 
 	if (__improbable((pmap == kernel_pmap) && (flush_self != TRUE))) {
-		panic("pmap_flush_tlbs: pmap == kernel_pmap && flush_self != TRUE; kernel CR3: 0x%llX, CPU active CR3: 0x%llX, CPU Task Map: %d", kernel_pmap->pm_cr3, current_cpu_datap()->cpu_active_cr3, current_cpu_datap()->cpu_task_map);
+		panic("pmap_flush_tlbs: pmap == kernel_pmap && flush_self != TRUE; kernel CR3: 0x%llX, pmap_cr3: 0x%llx, CPU active CR3: 0x%llX, CPU Task Map: %d", kernel_pmap->pm_cr3, pmap_cr3, current_cpu_datap()->cpu_active_cr3, current_cpu_datap()->cpu_task_map);
 	}
 
-	PMAP_TRACE_CONSTANT(PMAP_CODE(PMAP__FLUSH_TLBS) | DBG_FUNC_END,
-	    pmap, cpus_to_signal, startv, endv, 0);
+out:
+	PMAP_TRACE_CONSTANT(event_code | DBG_FUNC_END,
+			    pmap, cpus_to_signal, startv, endv, 0);
+
 }
 
 void
@@ -2199,7 +2504,7 @@ process_pmap_updates(void)
 		flush_tlb_raw();
 	}
 
-	__asm__ volatile("mfence");
+	mfence();
 }
 
 void
@@ -2208,7 +2513,8 @@ pmap_update_interrupt(void)
         PMAP_TRACE(PMAP_CODE(PMAP__UPDATE_INTERRUPT) | DBG_FUNC_START,
 		   0, 0, 0, 0, 0);
 
-	process_pmap_updates();
+	if (current_cpu_datap()->cpu_tlb_invalid)
+		process_pmap_updates();
 
         PMAP_TRACE(PMAP_CODE(PMAP__UPDATE_INTERRUPT) | DBG_FUNC_END,
 		   0, 0, 0, 0, 0);

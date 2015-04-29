@@ -363,6 +363,16 @@ mac_proc_check_get_task(struct ucred *cred, struct proc *p)
 	return (error);
 }
 
+int
+mac_proc_check_inherit_ipc_ports(struct proc *p, struct vnode *cur_vp, off_t cur_offset, struct vnode *img_vp, off_t img_offset, struct vnode *scriptvp)
+{
+	int error;
+
+	MAC_CHECK(proc_check_inherit_ipc_ports, p, cur_vp, cur_offset, img_vp, img_offset, scriptvp);
+
+	return (error);
+}
+
 /*
  * The type of maxprot in proc_check_map_anon must be equivalent to vm_prot_t
  * (defined in <mach/vm_prot.h>). mac_policy.h does not include any header
@@ -611,6 +621,40 @@ mac_proc_check_ledger(proc_t curp, proc_t proc, int ledger_op)
 
 	cred = kauth_cred_proc_ref(curp);
 	MAC_CHECK(proc_check_ledger, cred, proc, ledger_op);
+	kauth_cred_unref(&cred);
+
+	return (error);
+}
+
+int
+mac_proc_check_cpumon(proc_t curp)
+{
+	kauth_cred_t cred;
+	int error = 0;
+
+	if (!mac_proc_enforce ||
+	    !mac_proc_check_enforce(curp, MAC_PROC_ENFORCE))
+		return (0);
+
+	cred = kauth_cred_proc_ref(curp);
+	MAC_CHECK(proc_check_cpumon, cred);
+	kauth_cred_unref(&cred);
+
+	return (error);
+}
+
+int
+mac_proc_check_proc_info(proc_t curp, proc_t target, int callnum, int flavor)
+{
+	kauth_cred_t cred;
+	int error = 0;
+
+	if (!mac_proc_enforce ||
+	    !mac_proc_check_enforce(curp, MAC_PROC_ENFORCE))
+		return (0);
+
+	cred = kauth_cred_proc_ref(curp);
+	MAC_CHECK(proc_check_proc_info, cred, target, callnum, flavor);
 	kauth_cred_unref(&cred);
 
 	return (error);

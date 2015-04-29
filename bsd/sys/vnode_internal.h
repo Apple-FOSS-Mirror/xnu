@@ -93,14 +93,6 @@ struct label;
 
 LIST_HEAD(buflists, buf);
 
-#if CONFIG_VFS_FUNNEL
-struct unsafe_fsnode {
-	lck_mtx_t fsnodelock;
-	int32_t	  fsnode_count;
-	void *	  fsnodeowner;
-};
-#endif /* CONFIG_VFS_FUNNEL */
-
 #if CONFIG_TRIGGERS
 /*
  * VFS Internal (private) trigger vnode resolver info.
@@ -137,7 +129,7 @@ struct vnode {
 	TAILQ_ENTRY(vnode) v_freelist;		/* vnode freelist */
 	TAILQ_ENTRY(vnode) v_mntvnodes;		/* vnodes for mount point */
         LIST_HEAD(, namecache) v_nclinks;	/* name cache entries that name this vnode */
-        LIST_HEAD(, namecache) v_ncchildren;	/* name cache entries that regard us as there parent */
+        LIST_HEAD(, namecache) v_ncchildren;	/* name cache entries that regard us as their parent */
         vnode_t	 v_defer_reclaimlist;		/* in case we have to defer the reclaim to avoid recursion */
         uint32_t v_listflag;			/* flags protected by the vnode_list_lock (see below) */
 	uint32_t v_flag;			/* vnode flags (see below) */
@@ -178,14 +170,6 @@ struct vnode {
 	const char *v_name;			/* name component of the vnode */
 	vnode_t v_parent;			/* pointer to parent vnode */
 	struct lockf	*v_lockf;		/* advisory lock list head */
-#if CONFIG_VFS_FUNNEL
-        struct unsafe_fsnode *v_unsafefs;	/* pointer to struct used to lock */
-#else 
-	int32_t		v_reserved1;
-#ifdef __LP64__
-	int32_t		v_reserved2;
-#endif
-#endif /* CONFIG_VFS_FUNNEL */
 	int 	(**v_op)(void *);		/* vnode operations vector */
 	mount_t v_mount;			/* ptr to vfs we are in */
 	void *	v_data;				/* private data for fs */
@@ -274,6 +258,48 @@ struct vnode {
 #endif
 #define VOPENEVT        0x800000        /* if process is P_CHECKOPENEVT, then or in the O_EVTONLY flag on open */
 #define VNEEDSSNAPSHOT 0x1000000
+#define VNOCS	       0x2000000	/* is there no code signature available */
+#define VISDIRTY       0x4000000        /* vnode will need IO if reclaimed */	
+
+/*
+ * This structure describes vnode data which is specific to a file descriptor.
+ * It is currently used only for file descriptors which are for opened for
+ * directories.
+ */
+struct fd_vn_data {
+	lck_mtx_t fv_lock;   /* Used to serialize directory enumeration on fd */
+	off_t     fv_offset; /* Offset to be used */
+	void      *fv_dircookie; /* If FS doesn't like offsets in directories */
+	caddr_t   fv_buf;    /* Temporary buffer to store directory entries */
+	size_t    fv_bufsiz;  /* Valid size of fv_buf */
+	size_t    fv_bufdone; /* How much of fv_buf is processed */
+	size_t    fv_bufallocsiz; /* Allocation size determined for Buffer*/
+	off_t     fv_soff;   /* Starting FS offset for this buffer */
+	off_t     fv_eoff;   /* Ending FS offset for this buffer */
+	int       fv_eofflag;/* Does fv_eoff represent EOF ? */
+};
+
+/*
+ * FV_DIRBUF_START_SIZ is the initial size of the buffer passed to VNOP_READDIR.
+ * That may not be enough for some filesytems so the current algorithm works its
+ * way upto FV_DIRBUF_MAX_SIZ
+ */
+#define FV_DIRBUF_DIRENTRY_SIZ	(sizeof(struct direntry))
+#define FV_DIRBUF_START_SIZ	FV_DIRBUF_DIRENTRY_SIZ
+#define FV_DIRBUF_MAX_SIZ	(4*(sizeof(struct direntry)))
+
+#define FV_LOCK(fvd) lck_mtx_lock(&(((struct fd_vn_data *)fvd)->fv_lock))
+#define FV_UNLOCK(fvd) lck_mtx_unlock(&(((struct fd_vn_data *)fvd)->fv_lock))
+#define FV_BUF_FREE(fvd, tag)      \
+do {                               \
+	FREE(fvd->fv_buf, tag);    \
+	fvd->fv_buf = NULL;        \
+	fvd->fv_bufsiz = 0;        \
+	fvd->fv_bufdone = 0;       \
+	fvd->fv_soff = 0;          \
+	fvd->fv_eoff = 0;          \
+	fvd->fv_eofflag = 0;       \
+} while (0);
 
 /*
  * Global vnode data.
@@ -374,9 +400,10 @@ extern struct vnodeop_desc *vnodeop_descs[];
 
 struct ostat;
 
-#define BUILDPATH_NO_FS_ENTER 0x1 /* Use cache values, do not enter file system */
-#define BUILDPATH_CHECKACCESS 0x2 /* Check if parents have search rights */
-#define BUILDPATH_CHECK_MOVED 0x4 /* Return EAGAIN if the parent hierarchy is modified */
+#define BUILDPATH_NO_FS_ENTER     0x1 /* Use cache values, do not enter file system */
+#define BUILDPATH_CHECKACCESS     0x2 /* Check if parents have search rights */
+#define BUILDPATH_CHECK_MOVED     0x4 /* Return EAGAIN if the parent hierarchy is modified */
+#define BUILDPATH_VOLUME_RELATIVE 0x8 /* Return path relative to the nearest mount point */
 
 int	build_path(vnode_t first_vp, char *buff, int buflen, int *outlen, int flags, vfs_context_t ctx);
 
@@ -444,22 +471,17 @@ int	vn_setxattr(vnode_t, const char *, uio_t, int, vfs_context_t);
 int	vn_removexattr(vnode_t, const char *, int, vfs_context_t);
 int	vn_listxattr(vnode_t, uio_t, size_t *, int, vfs_context_t);
 
-int	default_getxattr(vnode_t, const char *, uio_t, size_t *, int, vfs_context_t);
-int	default_setxattr(vnode_t, const char *, uio_t, int, vfs_context_t);
-int	default_removexattr(vnode_t, const char *, int, vfs_context_t);
-
-int check_appledouble_header(vnode_t, vfs_context_t);
-
 #if NAMEDSTREAMS
 errno_t  vnode_getnamedstream(vnode_t, vnode_t *, const char *, enum nsoperation, int, vfs_context_t);
 errno_t  vnode_makenamedstream(vnode_t, vnode_t *, const char *, int, vfs_context_t);
 errno_t  vnode_removenamedstream(vnode_t, vnode_t, const char *, int, vfs_context_t);
 errno_t  vnode_flushnamedstream(vnode_t vp, vnode_t svp, vfs_context_t context);
-errno_t  vnode_relenamedstream(vnode_t vp, vnode_t svp, vfs_context_t context);
+errno_t  vnode_relenamedstream(vnode_t vp, vnode_t svp);
+errno_t  vnode_verifynamedstream (vnode_t vp);
 #endif
 
 
-void	nchinit(void) __attribute__((section("__TEXT, initcode")));
+void	nchinit(void);
 int	resize_namecache(uint32_t newsize);
 void	name_cache_lock_shared(void);
 void	name_cache_lock(void);
@@ -501,6 +523,9 @@ errno_t	vnode_resume(vnode_t);
 errno_t	vnode_suspend(vnode_t);
 
 
+errno_t	vnode_mtime(vnode_t, struct timespec *, vfs_context_t);
+errno_t vnode_flags(vnode_t, uint32_t *, vfs_context_t);
+
 errno_t	vnode_size(vnode_t, off_t *, vfs_context_t);
 errno_t	vnode_setsize(vnode_t, off_t, int ioflag, vfs_context_t);
 int	vnode_setattr_fallback(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx);
@@ -531,26 +556,30 @@ void vn_clearunionwait(vnode_t, int);
 void SPECHASH_LOCK(void);
 void SPECHASH_UNLOCK(void);
 
-void	vnode_authorize_init(void) __attribute__((section("__TEXT, initcode")));
+void	vnode_authorize_init(void);
 
-void	vfsinit(void) __attribute__((section("__TEXT, initcode")));
+void	vfsinit(void);
 void vnode_lock(vnode_t);
 void vnode_unlock(vnode_t);
 
 /*
  * XXX exported symbols; should be static
  */
-void	vfs_op_init(void) __attribute__((section("__TEXT, initcode")));
-void	vfs_opv_init(void) __attribute__((section("__TEXT, initcode")));
-int	vfs_sysctl(int *name, uint32_t namelen, user_addr_t oldp, size_t *oldlenp,
-		user_addr_t newp, size_t newlen, struct proc *p);
-int	sysctl_vnode(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req);
+void	vfs_op_init(void);
+void	vfs_opv_init(void);
 
 #ifdef BSD_KERNEL_PRIVATE
+int vfs_sysctl_node SYSCTL_HANDLER_ARGS;
 void vnode_setneedinactive(vnode_t);
 int 	vnode_hasnamedstreams(vnode_t); /* Does this vnode have associated named streams? */
 
 void nspace_proc_exit(struct proc *p);
+
+errno_t
+vnode_readdir64(struct vnode *vp, struct uio *uio, int flags, int *eofflag,
+                int *numdirent, vfs_context_t ctxp);
+
+void vnode_setswapmount(vnode_t);
 
 #if CONFIG_TRIGGERS
 /* VFS Internal Vnode Trigger Interfaces (Private) */

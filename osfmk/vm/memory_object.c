@@ -62,8 +62,6 @@
  *	External memory management interface control functions.
  */
 
-#include <advisory_pageout.h>
-
 /*
  *	Interface dependencies:
  */
@@ -103,9 +101,7 @@
 #include <vm/vm_purgeable_internal.h>	/* Needed by some vm_page.h macros */
 #include <vm/vm_shared_region.h>
 
-#if	MACH_PAGEMAP
 #include <vm/vm_external.h>
-#endif	/* MACH_PAGEMAP */
 
 #include <vm/vm_protos.h>
 
@@ -454,9 +450,17 @@ vm_object_sync(
 	vm_object_lock(object);
 	vm_object_paging_begin(object);
 
-	if (should_flush)
+	if (should_flush) {
 	        flags = MEMORY_OBJECT_DATA_FLUSH;
-	else
+		/*
+		 * This flush is from an msync(), not a truncate(), so the
+		 * contents of the file are not affected.
+		 * MEMORY_OBECT_DATA_NO_CHANGE lets vm_object_update() know
+		 * that the data is not changed and that there's no need to
+		 * push the old contents to a copy object.
+		 */
+		flags |= MEMORY_OBJECT_DATA_NO_CHANGE;
+	} else
 	        flags = 0;
 
 	if (should_iosync)
@@ -483,7 +487,7 @@ MACRO_BEGIN								\
         int			upl_flags;                              \
 	memory_object_t		pager;					\
 									\
-	if (object == slide_info.slide_object) {					\
+	if (object->object_slid) {					\
 		panic("Objects with slid pages not allowed\n");		\
 	}								\
 				                   			\
@@ -545,10 +549,10 @@ vm_object_update_extent(
 
 	        /*
 		 * Limit the number of pages to be cleaned at once to a contiguous
-		 * run, or at most MAX_UPL_TRANSFER size
+		 * run, or at most MAX_UPL_TRANSFER_BYTES
 		 */
 		if (data_cnt) {
-			if ((data_cnt >= PAGE_SIZE * MAX_UPL_TRANSFER) || (next_offset != offset)) {
+			if ((data_cnt >= MAX_UPL_TRANSFER_BYTES) || (next_offset != offset)) {
 
 				if (dw_count) {
 					vm_page_do_delayed_work(object, &dw_array[0], dw_count);
@@ -798,6 +802,7 @@ vm_object_update(
 		fault_info.interruptible = THREAD_UNINT;
 		fault_info.behavior  = VM_BEHAVIOR_SEQUENTIAL;
 		fault_info.user_tag  = 0;
+		fault_info.pmap_options = 0;
 		fault_info.lo_offset = copy_offset;
 		fault_info.hi_offset = copy_size;
 		fault_info.no_cache   = FALSE;
@@ -815,9 +820,11 @@ vm_object_update(
 			assert(fault_info.cluster_size == copy_size - i);
 
 			prot = 	VM_PROT_WRITE|VM_PROT_READ;
+			page = VM_PAGE_NULL;
 			result = vm_fault_page(copy_object, i, 
 					       VM_PROT_WRITE|VM_PROT_READ,
 					       FALSE,
+					       FALSE, /* page not looked up */
 					       &prot,
 					       &page,
 					       &top_page,
@@ -1096,7 +1103,7 @@ vm_object_set_attributes_common(
 	boolean_t	may_cache,
 	memory_object_copy_strategy_t copy_strategy,
 	boolean_t	temporary,
-        boolean_t	silent_overwrite,
+	__unused boolean_t	silent_overwrite,
 	boolean_t	advisory_pageout)
 {
 	boolean_t	object_became_ready;
@@ -1120,11 +1127,6 @@ vm_object_set_attributes_common(
 			return(KERN_INVALID_ARGUMENT);
 	}
 
-#if	!ADVISORY_PAGEOUT
-	if (silent_overwrite || advisory_pageout)
-		return(KERN_INVALID_ARGUMENT);
-
-#endif	/* !ADVISORY_PAGEOUT */
 	if (may_cache)
 		may_cache = TRUE;
 	if (temporary)
@@ -1140,7 +1142,7 @@ vm_object_set_attributes_common(
 	object->copy_strategy = copy_strategy;
 	object->can_persist = may_cache;
 	object->temporary = temporary;
-	object->silent_overwrite = silent_overwrite;
+//	object->silent_overwrite = silent_overwrite;
 	object->advisory_pageout = advisory_pageout;
 
 	/*
@@ -1191,7 +1193,8 @@ memory_object_change_attributes(
 	temporary = object->temporary;
 	may_cache = object->can_persist;
 	copy_strategy = object->copy_strategy;
-	silent_overwrite = object->silent_overwrite;
+//	silent_overwrite = object->silent_overwrite;
+	silent_overwrite = FALSE;
 	advisory_pageout = object->advisory_pageout;
 #if notyet
 	invalidate = object->invalidate;
@@ -1371,7 +1374,8 @@ memory_object_get_attributes(
 		behave->invalidate = FALSE;
 #endif
 		behave->advisory_pageout = object->advisory_pageout;
-		behave->silent_overwrite = object->silent_overwrite;
+//		behave->silent_overwrite = object->silent_overwrite;
+		behave->silent_overwrite = FALSE;
                 *count = MEMORY_OBJECT_BEHAVE_INFO_COUNT;
 		break;
 	    }
@@ -1495,8 +1499,9 @@ memory_object_iopl_request(
 		/* offset from beginning of named entry offset in object */
 		offset = offset + named_entry->offset;
 
-		if(named_entry->is_sub_map) 
-			return (KERN_INVALID_ARGUMENT);
+		if (named_entry->is_sub_map ||
+		    named_entry->is_copy)
+			return KERN_INVALID_ARGUMENT;
 		
 		named_entry_lock(named_entry);
 
@@ -1555,8 +1560,6 @@ memory_object_iopl_request(
 		return (KERN_INVALID_ARGUMENT);
 
 	if (!object->private) {
-		if (*upl_size > (MAX_UPL_TRANSFER*PAGE_SIZE))
-			*upl_size = (MAX_UPL_TRANSFER*PAGE_SIZE);
 		if (object->phys_contiguous) {
 			*flags = UPL_PHYS_CONTIG;
 		} else {
@@ -1915,6 +1918,22 @@ memory_object_mark_unused(
 		vm_object_cache_add(object);
 }
 
+void
+memory_object_mark_io_tracking(
+	memory_object_control_t control)
+{
+	vm_object_t             object;
+
+	if (control == NULL)
+		return;
+	object = memory_object_control_to_vm_object(control);
+
+	if (object != VM_OBJECT_NULL) {
+		vm_object_lock(object);
+		object->io_tracking = TRUE;
+		vm_object_unlock(object);
+	}
+}
 
 kern_return_t
 memory_object_pages_resident(
@@ -1954,17 +1973,34 @@ memory_object_signed(
 }
 
 boolean_t
-memory_object_is_slid(
+memory_object_is_signed(
 	memory_object_control_t	control)
 {
-	vm_object_t	object = VM_OBJECT_NULL;
-	vm_object_t	slide_object = slide_info.slide_object;
+	boolean_t	is_signed;
+	vm_object_t	object;
 
 	object = memory_object_control_to_vm_object(control);
 	if (object == VM_OBJECT_NULL)
 		return FALSE;
 
-	return (object == slide_object);
+	vm_object_lock_shared(object);
+	is_signed = object->code_signed;
+	vm_object_unlock(object);
+
+	return is_signed;
+}
+
+boolean_t
+memory_object_is_slid(
+	memory_object_control_t	control)
+{
+	vm_object_t	object = VM_OBJECT_NULL;
+
+	object = memory_object_control_to_vm_object(control);
+	if (object == VM_OBJECT_NULL)
+		return FALSE;
+
+	return object->object_slid;
 }
 
 static zone_t mem_obj_control_zone;

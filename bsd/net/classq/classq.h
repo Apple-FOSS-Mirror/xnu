@@ -113,8 +113,8 @@ struct pktcntr {
 typedef struct _class_queue_ {
 	MBUFQ_HEAD(mq_head) mbufq;	/* Packet queue */
 	u_int32_t	qlen;	/* Queue length (in number of packets) */
-	u_int32_t	qsize;	/* Approx. queue size (in number of bytes) */
 	u_int32_t	qlim;	/* Queue limit (in number of packets*) */
+	u_int64_t	qsize;	/* Approx. queue size (in number of bytes) */
 	classq_type_t	qtype;	/* Queue type */
 	classq_state_t	qstate;	/* Queue state */
 } class_queue_t;
@@ -169,9 +169,11 @@ extern void _flushq_flow(class_queue_t *, u_int32_t, u_int32_t *, u_int32_t *);
 
 extern void classq_init(void);
 
+#if PF_ECN
 extern u_int8_t read_dsfield(struct mbuf *, struct pf_mtag *);
 extern void	write_dsfield(struct mbuf *, struct pf_mtag *, u_int8_t);
 extern int	mark_ecn(struct mbuf *, struct pf_mtag *, int);
+#endif /* PF_ECN */
 #endif /* BSD_KERNEL_PRIVATE */
 
 #ifdef __cplusplus

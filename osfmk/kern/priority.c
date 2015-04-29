@@ -56,11 +56,11 @@
 /*
  */
 /*
- *	File:	clock_prim.c
+ *	File:	priority.c
  *	Author:	Avadis Tevanian, Jr.
  *	Date:	1986
  *
- *	Clock primitives.
+ *	Priority related scheduler bits.
  */
 
 #include <mach/boolean.h>
@@ -75,6 +75,10 @@
 #include <kern/processor.h>
 #include <kern/ledger.h>
 #include <machine/machparam.h>
+
+#ifdef CONFIG_MACH_APPROXIMATE_TIME
+#include <machine/commpage.h>  /* for commpage_update_mach_approximate_time */
+#endif
 
 /*
  *	thread_quantum_expire:
@@ -92,6 +96,9 @@ thread_quantum_expire(
 	processor_t			processor = p0;
 	thread_t			thread = p1;
 	ast_t				preempt;
+	uint64_t			ctime;
+
+	assert(processor == current_processor());
 
 	SCHED_STATS_QUANTUM_TIMER_EXPIRATION(processor);
 
@@ -102,8 +109,17 @@ thread_quantum_expire(
 	 * thread, we must credit the ledger before taking the thread lock. The ledger
 	 * pointers are only manipulated by the thread itself at the ast boundary.
 	 */
-	ledger_credit(thread->t_ledger, task_ledgers.cpu_time, thread->current_quantum);
-	ledger_credit(thread->t_threadledger, thread_ledgers.cpu_time, thread->current_quantum);
+	ledger_credit(thread->t_ledger, task_ledgers.cpu_time, thread->quantum_remaining);
+	ledger_credit(thread->t_threadledger, thread_ledgers.cpu_time, thread->quantum_remaining);
+#ifdef CONFIG_BANK
+	if (thread->t_bankledger) {
+		ledger_credit(thread->t_bankledger, bank_ledgers.cpu_time,
+				(thread->quantum_remaining - thread->t_deduct_bank_ledger_time));
+	}
+	thread->t_deduct_bank_ledger_time = 0;
+#endif
+
+	ctime = mach_absolute_time();
 
 	thread_lock(thread);
 
@@ -111,41 +127,31 @@ thread_quantum_expire(
 	 * We've run up until our quantum expiration, and will (potentially)
 	 * continue without re-entering the scheduler, so update this now.
 	 */
-	thread->last_run_time = processor->quantum_end;
+	thread->last_run_time = ctime;
 
+#ifdef CONFIG_MACH_APPROXIMATE_TIME
+	commpage_update_mach_approximate_time(ctime);
+#endif
 	/*
 	 *	Check for fail-safe trip.
 	 */
  	if ((thread->sched_mode == TH_MODE_REALTIME || thread->sched_mode == TH_MODE_FIXED) && 
- 	    !(thread->sched_flags & TH_SFLAG_PROMOTED) &&
+ 	    !(thread->sched_flags & TH_SFLAG_PROMOTED_MASK) &&
  	    !(thread->options & TH_OPT_SYSTEM_CRITICAL)) {
  		uint64_t new_computation;
   
- 		new_computation = processor->quantum_end - thread->computation_epoch;
+ 		new_computation = ctime - thread->computation_epoch;
  		new_computation += thread->computation_metered;
  		if (new_computation > max_unsafe_computation) {
 			KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_SCHED, MACH_FAILSAFE)|DBG_FUNC_NONE,
 					(uintptr_t)thread->sched_pri, (uintptr_t)thread->sched_mode, 0, 0, 0);
 
-			if (thread->sched_mode == TH_MODE_REALTIME) {
-				thread->priority = DEPRESSPRI;
-			}
-			
-			thread->saved_mode = thread->sched_mode;
+			thread->safe_release = ctime + sched_safe_duration;
 
-			if (SCHED(supports_timeshare_mode)) {
-				sched_share_incr();
-				thread->sched_mode = TH_MODE_TIMESHARE;
-			} else {
-				/* XXX handle fixed->fixed case */
-				thread->sched_mode = TH_MODE_FIXED;
-			}
-
-			thread->safe_release = processor->quantum_end + sched_safe_duration;
-			thread->sched_flags |= TH_SFLAG_FAILSAFE;
+			sched_thread_mode_demote(thread, TH_SFLAG_FAILSAFE);
 		}
 	}
-		
+
 	/*
 	 *	Recompute scheduled priority if appropriate.
 	 */
@@ -166,7 +172,6 @@ thread_quantum_expire(
 		processor->timeslice--;
 
 	thread_quantum_init(thread);
-	thread->last_quantum_refill_time = processor->quantum_end;
 
 	/* Reload precise timing global policy to thread-local policy */
 	thread->precise_user_kernel_time = use_precise_user_kernel_time(thread);
@@ -177,37 +182,47 @@ thread_quantum_expire(
 	 */
 	if (!thread->precise_user_kernel_time) {
 		timer_switch(PROCESSOR_DATA(processor, current_state),
-					 processor->quantum_end,
+					 ctime,
 					 PROCESSOR_DATA(processor, current_state));
 		timer_switch(PROCESSOR_DATA(processor, thread_timer),
-					 processor->quantum_end,
+					 ctime,
 					 PROCESSOR_DATA(processor, thread_timer));
 	}
 
-	processor->quantum_end = mach_absolute_time() + thread->current_quantum;
+	processor->quantum_end = ctime + thread->quantum_remaining;
 	timer_call_enter1(&processor->quantum_timer, thread,
-	    processor->quantum_end, TIMER_CALL_CRITICAL);
+	    processor->quantum_end, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
 
 	/*
 	 *	Context switch check.
 	 */
-	if ((preempt = csw_check(processor)) != AST_NONE)
+	if ((preempt = csw_check(processor, AST_QUANTUM)) != AST_NONE)
 		ast_on(preempt);
-	else {
-		processor_set_t		pset = processor->processor_set;
-
-		pset_lock(pset);
-
-		pset_pri_hint(pset, processor, processor->current_pri);
-		pset_count_hint(pset, processor, SCHED(processor_runq_count)(processor));
-
-		pset_unlock(pset);
-	}
 
 	thread_unlock(thread);
+
+#if defined(CONFIG_SCHED_TIMESHARE_CORE)
+	sched_traditional_consider_maintenance(ctime);
+#endif /* CONFIG_SCHED_TIMESHARE_CORE */	
 }
 
-#if defined(CONFIG_SCHED_TRADITIONAL)
+/*
+ *	sched_set_thread_base_priority:
+ *
+ *	Set the base priority of the thread
+ *	and reset its scheduled priority.
+ *
+ *	Called with the thread locked.
+ */
+void
+sched_set_thread_base_priority(thread_t thread, int priority)
+{
+	thread->priority = priority;
+	SCHED(compute_priority)(thread, FALSE);
+}
+
+
+#if defined(CONFIG_SCHED_TIMESHARE_CORE)
 
 void
 sched_traditional_quantum_expire(thread_t	thread __unused)
@@ -241,7 +256,7 @@ lightweight_update_priority(thread_t thread)
 		 * the thread has not been promoted
 		 * and is not depressed.
 		 */
-		if (	!(thread->sched_flags & TH_SFLAG_PROMOTED)	&&
+		if (	!(thread->sched_flags & TH_SFLAG_PROMOTED_MASK)	&&
 			!(thread->sched_flags & TH_SFLAG_DEPRESSED_MASK)		)
 			compute_my_priority(thread);
 	}	
@@ -272,58 +287,21 @@ static struct shift_data	sched_decay_shifts[SCHED_DECAY_TICKS] = {
  *
  *	Calculate the timesharing priority based upon usage and load.
  */
-#ifdef CONFIG_EMBEDDED
+extern int sched_pri_decay_band_limit;
 
-#define do_priority_computation(thread, pri)							\
-	MACRO_BEGIN															\
-	(pri) = (thread)->priority		/* start with base priority */		\
-	    - ((thread)->sched_usage >> (thread)->pri_shift);				\
-	if ((pri) < MAXPRI_THROTTLE) {										\
-		if ((thread)->task->max_priority > MAXPRI_THROTTLE)				\
-			(pri) = MAXPRI_THROTTLE;									\
-		else															\
-			if ((pri) < MINPRI_USER)									\
-				(pri) = MINPRI_USER;									\
-	} else																\
-	if ((pri) > MAXPRI_KERNEL)											\
-		(pri) = MAXPRI_KERNEL;											\
-	MACRO_END
 
-#else
+static int do_priority_computation(thread_t th) {															
+	register int priority = th->priority		/* start with base priority */		
+	    - (th->sched_usage >> th->pri_shift);				
+	if (priority < MINPRI_USER)											
+		priority = MINPRI_USER;											
+	else																
+	if (priority > MAXPRI_KERNEL)											
+		priority = MAXPRI_KERNEL;	
 
-#define do_priority_computation(thread, pri)							\
-	MACRO_BEGIN															\
-	(pri) = (thread)->priority		/* start with base priority */		\
-	    - ((thread)->sched_usage >> (thread)->pri_shift);				\
-	if ((pri) < MINPRI_USER)											\
-		(pri) = MINPRI_USER;											\
-	else																\
-	if ((pri) > MAXPRI_KERNEL)											\
-		(pri) = MAXPRI_KERNEL;											\
-	MACRO_END
-
-#endif /* defined(CONFIG_SCHED_TRADITIONAL) */
-
-#endif
-
-/*
- *	set_priority:
- *
- *	Set the base priority of the thread
- *	and reset its scheduled priority.
- *
- *	Called with the thread locked.
- */
-void
-set_priority(
-	register thread_t	thread,
-	register int		priority)
-{
-	thread->priority = priority;
-	SCHED(compute_priority)(thread, FALSE);
+	return priority;										
 }
 
-#if defined(CONFIG_SCHED_TRADITIONAL)
 
 /*
  *	compute_priority:
@@ -341,14 +319,13 @@ compute_priority(
 {
 	register int		priority;
 
-	if (	!(thread->sched_flags & TH_SFLAG_PROMOTED)			&&
-			(!(thread->sched_flags & TH_SFLAG_DEPRESSED_MASK)	||
-				 override_depress							)		) {
-		if (thread->sched_mode == TH_MODE_TIMESHARE)
-			do_priority_computation(thread, priority);
-		else
-			priority = thread->priority;
+	if (thread->sched_mode == TH_MODE_TIMESHARE)
+		priority = do_priority_computation(thread);
+	else
+		priority = thread->priority;
 
+	if ((!(thread->sched_flags & TH_SFLAG_PROMOTED_MASK) || (priority > thread->sched_pri)) &&
+		(!(thread->sched_flags & TH_SFLAG_DEPRESSED_MASK) || override_depress)) {
 		set_sched_pri(thread, priority);
 	}
 }
@@ -370,8 +347,17 @@ compute_my_priority(
 {
 	register int		priority;
 
-	do_priority_computation(thread, priority);
+	priority = do_priority_computation(thread);
 	assert(thread->runq == PROCESSOR_NULL);
+
+	if (priority != thread->sched_pri) {
+		KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_SCHED, MACH_SCHED_DECAY_PRIORITY)|DBG_FUNC_NONE,
+			     (uintptr_t)thread_tid(thread),
+			     thread->priority,
+			     thread->sched_pri,
+			     priority,
+			     0);
+	}
 	thread->sched_pri = priority;
 }
 
@@ -409,7 +395,16 @@ update_priority(
 	ticks = sched_tick - thread->sched_stamp;
 	assert(ticks != 0);
 	thread->sched_stamp += ticks;
-	thread->pri_shift = sched_pri_shift;
+	if (sched_use_combined_fgbg_decay)
+		thread->pri_shift = sched_combined_fgbg_pri_shift;
+	else if (thread->sched_flags & TH_SFLAG_THROTTLED)
+		thread->pri_shift = sched_background_pri_shift;
+	else
+		thread->pri_shift = sched_pri_shift;
+
+	/* If requested, accelerate aging of sched_usage */
+	if (sched_decay_usage_age_factor > 1)
+		ticks *= sched_decay_usage_age_factor;
 
 	/*
 	 *	Gather cpu usage data.
@@ -455,83 +450,42 @@ update_priority(
 	/*
 	 *	Check for fail-safe release.
 	 */
-	if (	(thread->sched_flags & TH_SFLAG_FAILSAFE)		&&
-			mach_absolute_time() >= thread->safe_release		) {
-		if (thread->saved_mode != TH_MODE_TIMESHARE) {
-			if (thread->saved_mode == TH_MODE_REALTIME) {
-				thread->priority = BASEPRI_RTQUEUES;
-			}
-
-			thread->sched_mode = thread->saved_mode;
-			thread->saved_mode = TH_MODE_NONE;
-
-			if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN)
-				sched_share_decr();
-
-			if (!(thread->sched_flags & TH_SFLAG_DEPRESSED_MASK))
-				set_sched_pri(thread, thread->priority);
-		}
-
-		thread->sched_flags &= ~TH_SFLAG_FAILSAFE;
+	if ((thread->sched_flags & TH_SFLAG_FAILSAFE) &&
+	    mach_absolute_time() >= thread->safe_release) {
+		sched_thread_mode_undemote(thread, TH_SFLAG_FAILSAFE);
 	}
 
-#if CONFIG_EMBEDDED
-	/* Check for pending throttle transitions, and safely switch queues */
-	if (thread->sched_flags & TH_SFLAG_PENDING_THROTTLE_MASK) {
-			boolean_t		removed = thread_run_queue_remove(thread);
-
-			if (thread->sched_flags & TH_SFLAG_PENDING_THROTTLE_DEMOTION) {
-				if (thread->sched_mode == TH_MODE_REALTIME) {
-					thread->saved_mode = thread->sched_mode;
-					thread->sched_mode = TH_MODE_TIMESHARE;
-
-					if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN)
-						sched_share_incr();
-				} else {
-					/*
-					 * It's possible that this is a realtime thread that has
-					 * already tripped the failsafe, in which case saved_mode
-					 * is already set correctly.
-					 */
-					if (!(thread->sched_flags & TH_SFLAG_FAILSAFE)) {
-						thread->saved_mode = thread->sched_mode;
-					}
-					thread->sched_flags &= ~TH_SFLAG_FAILSAFE;
-				}
-				thread->sched_flags |= TH_SFLAG_THROTTLED;
-
-			} else {
-				if ((thread->sched_mode == TH_MODE_TIMESHARE)
-					&& (thread->saved_mode == TH_MODE_REALTIME)) {
-					if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN)
-						sched_share_decr();
-				}
-
-				thread->sched_mode = thread->saved_mode;
-				thread->saved_mode = TH_MODE_NONE;
-				thread->sched_flags &= ~TH_SFLAG_THROTTLED;
-			}
-
-			thread->sched_flags &= ~(TH_SFLAG_PENDING_THROTTLE_MASK);
-
-			if (removed)
-				thread_setrun(thread, SCHED_TAILQ);
-	}
-#endif
 
 	/*
 	 *	Recompute scheduled priority if appropriate.
 	 */
 	if (	(thread->sched_mode == TH_MODE_TIMESHARE)	&&
-			!(thread->sched_flags & TH_SFLAG_PROMOTED)	&&
+			!(thread->sched_flags & TH_SFLAG_PROMOTED_MASK)	&&
 			!(thread->sched_flags & TH_SFLAG_DEPRESSED_MASK)		) {
 		register int		new_pri;
 
-		do_priority_computation(thread, new_pri);
+		new_pri = do_priority_computation(thread);
 		if (new_pri != thread->sched_pri) {
 			boolean_t		removed = thread_run_queue_remove(thread);
 
+#if 0
+			if (sched_use_combined_fgbg_decay && ((thread)->task->max_priority > MAXPRI_THROTTLE) && (new_pri == MAXPRI_THROTTLE)) {
+				/* with the alternate (new) algorithm, would we have decayed this far? */
+				int alt_pri = thread->priority - (thread->sched_usage >> sched_pri_shift);
+				if ((alt_pri > new_pri) && (sched_background_count > 0)) {
+					printf("thread %p would have decayed to only %d instead of %d\n", thread, alt_pri, new_pri);
+				}
+			}
+#endif
+
+			KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_SCHED, MACH_SCHED_DECAY_PRIORITY)|DBG_FUNC_NONE,
+							  (uintptr_t)thread_tid(thread),
+							  thread->priority,
+							  thread->sched_pri,
+							  new_pri,
+							  0);
 			thread->sched_pri = new_pri;
+
 			if (removed)
 				thread_setrun(thread, SCHED_TAILQ);
 		}
@@ -540,4 +494,254 @@ update_priority(
 	return;
 }
 
-#endif /* CONFIG_SCHED_TRADITIONAL */
+#endif /* CONFIG_SCHED_TIMESHARE_CORE */
+
+#if MACH_ASSERT
+/* sched_mode == TH_MODE_TIMESHARE controls whether a thread has a timeshare count when it has a run count */
+
+void sched_share_incr(thread_t thread) {
+	assert((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN);
+	assert(thread->sched_mode == TH_MODE_TIMESHARE);
+	assert(thread->SHARE_COUNT == 0);
+	thread->SHARE_COUNT++;
+	(void)hw_atomic_add(&sched_share_count, 1);
+}
+
+void sched_share_decr(thread_t thread) {
+	assert((thread->state & (TH_RUN|TH_IDLE)) != TH_RUN || thread->sched_mode != TH_MODE_TIMESHARE);
+	assert(thread->SHARE_COUNT == 1);
+	(void)hw_atomic_sub(&sched_share_count, 1);
+	thread->SHARE_COUNT--;
+}
+
+/* TH_SFLAG_THROTTLED controls whether a thread has a background count when it has a run count and a share count */
+
+void sched_background_incr(thread_t thread) {
+	assert((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN);
+	assert(thread->sched_mode == TH_MODE_TIMESHARE);
+	assert((thread->sched_flags & TH_SFLAG_THROTTLED) == TH_SFLAG_THROTTLED);
+
+	assert(thread->BG_COUNT == 0);
+	thread->BG_COUNT++;
+	int val = hw_atomic_add(&sched_background_count, 1);
+	assert(val >= 0);
+
+	/* Always do the background change while holding a share count */
+	assert(thread->SHARE_COUNT == 1);
+}
+
+void sched_background_decr(thread_t thread) {
+	if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN && thread->sched_mode == TH_MODE_TIMESHARE)
+		assert((thread->sched_flags & TH_SFLAG_THROTTLED) != TH_SFLAG_THROTTLED);
+	assert(thread->BG_COUNT == 1);
+	int val = hw_atomic_sub(&sched_background_count, 1);
+	thread->BG_COUNT--;
+	assert(val >= 0);
+	assert(thread->BG_COUNT == 0);
+
+	/* Always do the background change while holding a share count */
+	assert(thread->SHARE_COUNT == 1);
+}
+
+
+void
+assert_thread_sched_count(thread_t thread) {
+	/* Only 0 or 1 are acceptable values */
+	assert(thread->BG_COUNT    == 0 || thread->BG_COUNT    == 1);
+	assert(thread->SHARE_COUNT == 0 || thread->SHARE_COUNT == 1);
+
+	/* BG is only allowed when you already have a share count */
+	if (thread->BG_COUNT == 1)
+		assert(thread->SHARE_COUNT == 1);
+	if (thread->SHARE_COUNT == 0)
+		assert(thread->BG_COUNT == 0);
+
+	if ((thread->state & (TH_RUN|TH_IDLE)) != TH_RUN ||
+	    (thread->sched_mode != TH_MODE_TIMESHARE))
+		assert(thread->SHARE_COUNT == 0);
+
+	if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN &&
+	    (thread->sched_mode == TH_MODE_TIMESHARE))
+		assert(thread->SHARE_COUNT == 1);
+
+	if ((thread->state & (TH_RUN|TH_IDLE)) != TH_RUN ||
+	    (thread->sched_mode != TH_MODE_TIMESHARE)    ||
+	    !(thread->sched_flags & TH_SFLAG_THROTTLED))
+		assert(thread->BG_COUNT == 0);
+
+	if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN &&
+	    (thread->sched_mode == TH_MODE_TIMESHARE)    &&
+	    (thread->sched_flags & TH_SFLAG_THROTTLED))
+		assert(thread->BG_COUNT == 1);
+}
+
+#endif /* MACH_ASSERT */
+
+/*
+ * Set the thread's true scheduling mode
+ * Called with thread mutex and thread locked
+ * The thread has already been removed from the runqueue.
+ *
+ * (saved_mode is handled before this point)
+ */
+void
+sched_set_thread_mode(thread_t thread, sched_mode_t new_mode)
+{
+	assert_thread_sched_count(thread);
+
+	sched_mode_t old_mode = thread->sched_mode;
+
+	thread->sched_mode = new_mode;
+
+	switch (new_mode) {
+		case TH_MODE_FIXED:
+		case TH_MODE_REALTIME:
+			if (old_mode == TH_MODE_TIMESHARE) {
+				if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN) {
+					if (thread->sched_flags & TH_SFLAG_THROTTLED)
+						sched_background_decr(thread);
+
+					sched_share_decr(thread);
+				}
+			}
+			break;
+
+		case TH_MODE_TIMESHARE:
+			if (old_mode != TH_MODE_TIMESHARE) {
+				if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN) {
+					sched_share_incr(thread);
+
+					if (thread->sched_flags & TH_SFLAG_THROTTLED)
+						sched_background_incr(thread);
+				}
+			}
+			break;
+
+		default:
+			panic("unexpected mode: %d", new_mode);
+			break;
+	}
+
+	assert_thread_sched_count(thread);
+}
+
+/*
+ * Demote the true scheduler mode to timeshare (called with the thread locked)
+ */
+void
+sched_thread_mode_demote(thread_t thread, uint32_t reason)
+{
+	assert(reason & TH_SFLAG_DEMOTED_MASK);
+	assert((thread->sched_flags & reason) != reason);
+	assert_thread_sched_count(thread);
+
+	if (thread->policy_reset)
+		return;
+
+	if (thread->sched_flags & TH_SFLAG_DEMOTED_MASK) {
+		/* Another demotion reason is already active */
+		thread->sched_flags |= reason;
+		return;
+	}
+
+	assert(thread->saved_mode == TH_MODE_NONE);
+
+	boolean_t removed = thread_run_queue_remove(thread);
+
+	if (thread->sched_mode == TH_MODE_REALTIME)
+		thread->priority = DEPRESSPRI;
+
+	thread->sched_flags |= reason;
+
+	thread->saved_mode = thread->sched_mode;
+
+	sched_set_thread_mode(thread, TH_MODE_TIMESHARE);
+
+	if (removed)
+		thread_setrun(thread, SCHED_TAILQ);
+
+	assert_thread_sched_count(thread);
+}
+
+/*
+ * Un-demote the true scheduler mode back to the saved mode (called with the thread locked)
+ */
+void
+sched_thread_mode_undemote(thread_t thread, uint32_t reason)
+{
+	assert(reason & TH_SFLAG_DEMOTED_MASK);
+	assert((thread->sched_flags & reason) == reason);
+	assert(thread->saved_mode != TH_MODE_NONE);
+	assert(thread->sched_mode == TH_MODE_TIMESHARE);
+	assert(thread->policy_reset == 0);
+
+	assert_thread_sched_count(thread);
+
+	thread->sched_flags &= ~reason;
+
+	if (thread->sched_flags & TH_SFLAG_DEMOTED_MASK) {
+		/* Another demotion reason is still active */
+		return;
+	}
+
+	boolean_t removed = thread_run_queue_remove(thread);
+
+	sched_set_thread_mode(thread, thread->saved_mode);
+
+	thread->saved_mode = TH_MODE_NONE;
+
+	if (thread->sched_mode == TH_MODE_REALTIME) {
+		thread->priority = BASEPRI_RTQUEUES;
+	}
+
+	SCHED(compute_priority)(thread, FALSE);
+
+	if (removed)
+		thread_setrun(thread, SCHED_TAILQ);
+}
+
+/*
+ * Set the thread to be categorized as 'background'
+ * Called with thread mutex and thread lock held
+ *
+ * TODO: Eventually, 'background' should be a true sched_mode.
+ */
+void
+sched_set_thread_throttled(thread_t thread, boolean_t wants_throttle)
+{
+	if (thread->policy_reset)
+		return;
+
+	assert(((thread->sched_flags & TH_SFLAG_THROTTLED) ? TRUE : FALSE) != wants_throttle);
+
+	assert_thread_sched_count(thread);
+
+	/*
+	 * When backgrounding a thread, iOS has the semantic that
+	 * realtime and fixed priority threads should be demoted
+	 * to timeshare background threads.
+	 *
+	 * On OSX, realtime and fixed priority threads don't lose their mode.
+	 */
+
+	if (wants_throttle) {
+		thread->sched_flags |= TH_SFLAG_THROTTLED;
+		if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN && thread->sched_mode == TH_MODE_TIMESHARE) {
+			sched_background_incr(thread);
+		}
+
+		assert_thread_sched_count(thread);
+
+	} else {
+		thread->sched_flags &= ~TH_SFLAG_THROTTLED;
+		if ((thread->state & (TH_RUN|TH_IDLE)) == TH_RUN && thread->sched_mode == TH_MODE_TIMESHARE) {
+			sched_background_decr(thread);
+		}
+
+		assert_thread_sched_count(thread);
+
+	}
+
+	assert_thread_sched_count(thread);
+}
+

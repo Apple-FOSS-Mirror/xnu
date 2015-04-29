@@ -104,9 +104,9 @@ struct	sigacts {
  * values should be non-intersecting with values defined in signal.h, e.g.:
  * SIG_IGN, SIG_DFL, SIG_ERR, SIG_IGN.
  */
-#define	KERN_SIG_CATCH	(void (*)(int))2
-#define	KERN_SIG_HOLD	(void (*)(int))3
-#define	KERN_SIG_WAIT	(void (*)(int))4
+#define	KERN_SIG_CATCH	CAST_USER_ADDR_T(2)
+#define	KERN_SIG_HOLD	CAST_USER_ADDR_T(3)
+#define	KERN_SIG_WAIT	CAST_USER_ADDR_T(4)
 
 /*
  * get signal action for process and signal; currently only for current process
@@ -191,7 +191,7 @@ int sigprop[NSIG + 1] = {
 /*
  * Machine-independent functions:
  */
-int	coredump(struct proc *p);
+int	coredump(struct proc *p, uint32_t reserve_mb, int ignore_ulimit);
 void	execsigs(struct proc *p, thread_t thread);
 void	gsignal(int pgid, int sig);
 int	issignal_locked(struct proc *p);
@@ -199,7 +199,7 @@ int	CURSIG(struct proc *p);
 int clear_procsiglist(struct proc *p, int bit, int in_signalstart);
 int set_procsigmask(struct proc *p, int bit);
 void	postsig_locked(int sig);
-void	siginit(struct proc *p) __attribute__((section("__TEXT, initcode")));
+void	siginit(struct proc *p);
 void	trapsignal(struct proc *p, int sig, unsigned code);
 void	pt_setrunnable(struct proc *p);
 int	hassigprop(int sig, int prop);

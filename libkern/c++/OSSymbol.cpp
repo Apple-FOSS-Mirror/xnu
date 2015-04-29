@@ -30,9 +30,7 @@
 #include <string.h>
 #include <sys/cdefs.h>
 
-__BEGIN_DECLS
-#include <kern/lock.h>
-__END_DECLS
+#include <kern/locks.h>
 
 #include <libkern/c++/OSSymbol.h>
 #include <libkern/c++/OSLib.h>
@@ -40,7 +38,7 @@ __END_DECLS
 
 #define super OSString
 
-typedef struct { int i, j; } OSSymbolPoolState;
+typedef struct { unsigned int i, j; } OSSymbolPoolState;
 
 #if OSALLOCDEBUG
 extern "C" {
@@ -172,6 +170,13 @@ OSSymbolPool::OSSymbolPool(const OSSymbolPool *old)
 OSSymbolPool::~OSSymbolPool()
 {
     if (buckets) {
+        Bucket *thisBucket;
+        for (thisBucket = &buckets[0]; thisBucket < &buckets[nBuckets]; thisBucket++) {
+            if (thisBucket->count > 1) {
+                kfree(thisBucket->symbolP, thisBucket->count * sizeof(OSSymbol *));
+                ACCUMSIZE(-(thisBucket->count * sizeof(OSSymbol *)));
+            }
+        }
         kfree(buckets, nBuckets * sizeof(Bucket));
         ACCUMSIZE(-(nBuckets * sizeof(Bucket)));
     }
@@ -363,7 +368,7 @@ void OSSymbolPool::removeSymbol(OSSymbol *sym)
 
     if (!j) {
 	// couldn't find the symbol; probably means string hash changed
-        panic("removeSymbol");
+        panic("removeSymbol %s count %d ", sym->string ? sym->string : "no string", count);
         return;
     }
 
@@ -378,7 +383,7 @@ void OSSymbolPool::removeSymbol(OSSymbol *sym)
             return;
         }
 	// couldn't find the symbol; probably means string hash changed
-    	panic("removeSymbol");
+    	panic("removeSymbol %s count %d ", sym->string ? sym->string : "no string", count);
         return;
     }
 
@@ -405,7 +410,7 @@ void OSSymbolPool::removeSymbol(OSSymbol *sym)
             return;
         }
 	// couldn't find the symbol; probably means string hash changed
-    	panic("removeSymbol");
+    	panic("removeSymbol %s count %d ", sym->string ? sym->string : "no string", count);
         return;
     }
 
@@ -432,7 +437,7 @@ void OSSymbolPool::removeSymbol(OSSymbol *sym)
         }
     }
     // couldn't find the symbol; probably means string hash changed
-    panic("removeSymbol");
+    panic("removeSymbol %s count %d ", sym->string ? sym->string : "no string", count);
 }
 
 /*
@@ -458,7 +463,7 @@ void OSSymbol::initialize()
     pool = new OSSymbolPool;
     assert(pool);
 
-    if (!pool->init()) {
+    if (pool && !pool->init()) {
         delete pool;
         assert(false);
     };

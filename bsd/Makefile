@@ -16,7 +16,6 @@ INSTINC_SUBDIRS = \
 	machine \
 	miscfs \
 	net \
-	netat \
 	netinet \
 	netinet6 \
 	netkey \
@@ -26,57 +25,52 @@ INSTINC_SUBDIRS = \
 	uuid \
 	vfs
 
-INSTINC_SUBDIRS_I386 = \
+INSTINC_SUBDIRS_X86_64 = \
 	i386 \
 	crypto
 
-INSTINC_SUBDIRS_X86_64 = \
+INSTINC_SUBDIRS_X86_64H = \
 	i386 \
 	crypto
 
 INSTINC_SUBDIRS_ARM = \
 	arm 
 
+
 EXPINC_SUBDIRS = \
 	bsm \
-	crypto \
 	dev \
 	hfs \
 	libkern \
 	machine \
 	miscfs \
 	net \
-	netat \
 	netinet \
 	netinet6 \
 	netkey \
-	nfs \
 	security \
 	sys \
 	uuid \
 	vfs \
 	vm
 
-EXPINC_SUBDIRS_I386 = \
+EXPINC_SUBDIRS_X86_64 = \
 	i386 
 
-EXPINC_SUBDIRS_X86_64 = \
+EXPINC_SUBDIRS_X86_64H = \
 	i386 
 
 EXPINC_SUBDIRS_ARM = \
 	arm 
 
-SETUP_SUBDIRS =
 
 COMP_SUBDIRS = 	\
 	conf
 
-INST_SUBDIRS =	\
-	kern
-
-INSTMAN_SUBDIRS = \
+INSTTEXTFILES_SUBDIRS =	\
+	dev \
+	kern \
 	man
-
 
 include $(MakeInc_rule)
 include $(MakeInc_dir)

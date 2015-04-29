@@ -238,7 +238,7 @@ thread_suspend(
 	thread_mtx_unlock(thread);
 
 	if (thread != self && result == KERN_SUCCESS)
-		thread_wait(thread, TRUE);
+		thread_wait(thread, FALSE);
 
 	return (result);
 }
@@ -434,7 +434,7 @@ thread_get_state(
 
 			thread_mtx_unlock(thread);
 
-			if (thread_stop(thread)) {
+			if (thread_stop(thread, FALSE)) {
 				thread_mtx_lock(thread);
 				result = machine_thread_get_state(
 										thread, flavor, state, state_count);
@@ -484,7 +484,7 @@ thread_set_state_internal(
 
 			thread_mtx_unlock(thread);
 
-			if (thread_stop(thread)) {
+			if (thread_stop(thread, TRUE)) {
 				thread_mtx_lock(thread);
 				result = machine_thread_set_state(
 										thread, flavor, state, state_count);
@@ -564,7 +564,7 @@ thread_state_initialize(
 
 			thread_mtx_unlock(thread);
 
-			if (thread_stop(thread)) {
+			if (thread_stop(thread, TRUE)) {
 				thread_mtx_lock(thread);
 				result = machine_thread_state_initialize( thread );
 				thread_unstop(thread);
@@ -605,7 +605,7 @@ thread_dup(
 
 		thread_mtx_unlock(target);
 
-		if (thread_stop(target)) {
+		if (thread_stop(target, TRUE)) {
 			thread_mtx_lock(target);
 			result = machine_thread_dup(self, target);
 			if (self->affinity_set != AFFINITY_SET_NULL)
@@ -658,6 +658,51 @@ thread_getstatus(
 	mach_msg_type_number_t	*count)
 {
 	return (thread_get_state(thread, flavor, tstate, count));
+}
+
+/*
+ *	Change thread's machine-dependent userspace TSD base.
+ *  Called with nothing locked.  Returns same way.
+ */
+kern_return_t
+thread_set_tsd_base(
+	thread_t			thread,
+	mach_vm_offset_t	tsd_base)
+{
+	kern_return_t		result = KERN_SUCCESS;
+
+	if (thread == THREAD_NULL)
+		return (KERN_INVALID_ARGUMENT);
+
+	thread_mtx_lock(thread);
+
+	if (thread->active) {
+		if (thread != current_thread()) {
+			thread_hold(thread);
+
+			thread_mtx_unlock(thread);
+
+			if (thread_stop(thread, TRUE)) {
+				thread_mtx_lock(thread);
+				result = machine_thread_set_tsd_base(thread, tsd_base);
+				thread_unstop(thread);
+			}
+			else {
+				thread_mtx_lock(thread);
+				result = KERN_ABORTED;
+			}
+
+			thread_release(thread);
+		}
+		else
+			result = machine_thread_set_tsd_base(thread, tsd_base);
+	}
+	else
+		result = KERN_TERMINATED;
+
+	thread_mtx_unlock(thread);
+
+	return (result);
 }
 
 /*

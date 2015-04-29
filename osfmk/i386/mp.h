@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -75,7 +75,7 @@
 #include <mach/kern_return.h>
 #include <mach/i386/thread_status.h>
 #include <mach/vm_types.h>
-#include <kern/lock.h>
+#include <kern/simple_lock.h>
 
 __BEGIN_DECLS
 
@@ -107,6 +107,7 @@ extern 	volatile boolean_t force_immediate_debugger_NMI;
 extern  volatile boolean_t pmap_tlb_flush_timeout;
 extern  volatile usimple_lock_t spinlock_timed_out;
 extern  volatile uint32_t spinlock_owner_cpu;
+extern  uint32_t spinlock_timeout_NMI(uintptr_t thread_addr);
 
 extern	uint64_t	LastDebuggerEntryAllowance;
 
@@ -146,7 +147,7 @@ typedef enum	{KDP_XCPU_NONE = 0xffff, KDP_CURRENT_LCPU = 0xfffe} kdp_cpu_t;
 #endif
 
 typedef uint32_t cpu_t;
-typedef uint32_t cpumask_t;
+typedef volatile long cpumask_t;
 static inline cpumask_t
 cpu_to_cpumask(cpu_t cpu)
 {
@@ -155,6 +156,9 @@ cpu_to_cpumask(cpu_t cpu)
 #define CPUMASK_ALL	0xffffffff
 #define CPUMASK_SELF	cpu_to_cpumask(cpu_number())
 #define CPUMASK_OTHERS	(CPUMASK_ALL & ~CPUMASK_SELF)
+
+/* Initialation routing called at processor registration */
+extern void mp_cpus_call_cpu_init(int cpu);
 
 /*
  * Invoke a function (possibly NULL) on a set of cpus specified by a mask.
@@ -182,6 +186,10 @@ extern cpu_t mp_cpus_call1(
 		cpumask_t	*cpus_calledp,
 		cpumask_t	*cpus_notcalledp);
 
+extern void mp_cpus_NMIPI(cpumask_t cpus);
+
+/* Interrupt a set of cpus, forcing an exit out of non-root mode */
+extern void mp_cpus_kick(cpumask_t cpus);
 /*
  * Power-management-specific SPI to:
  *  - register a callout function, and
@@ -265,27 +273,7 @@ i_bit_impl(long word, long bit) {
 
 #if	MACH_RT
 
-#if defined(__i386__)
-
-#define _DISABLE_PREEMPTION 					\
-	incl	%gs:CPU_PREEMPTION_LEVEL
-
-#define _ENABLE_PREEMPTION 					\
-	decl	%gs:CPU_PREEMPTION_LEVEL		;	\
-	jne	9f					;	\
-	pushl	%eax					;	\
-	pushl	%ecx					;	\
-	pushl	%edx					;	\
-	call	EXT(kernel_preempt_check)		;	\
-	popl	%edx					;	\
-	popl	%ecx					;	\
-	popl	%eax					;	\
-9:	
-
-#define _ENABLE_PREEMPTION_NO_CHECK				\
-	decl	%gs:CPU_PREEMPTION_LEVEL
-
-#elif defined(__x86_64__)
+#if   defined(__x86_64__)
 
 #define _DISABLE_PREEMPTION 					\
 	incl	%gs:CPU_PREEMPTION_LEVEL
@@ -304,63 +292,12 @@ i_bit_impl(long word, long bit) {
 #endif
 
 /* x86_64 just calls through to the other macro directly */
-#if	MACH_ASSERT && defined(__i386__)
-#define DISABLE_PREEMPTION					\
-	pushl	%eax;						\
-	pushl	%ecx;						\
-	pushl	%edx;						\
-	call	EXT(_disable_preemption);			\
-	popl	%edx;						\
-	popl	%ecx;						\
-	popl	%eax
-#define ENABLE_PREEMPTION					\
-	pushl	%eax;						\
-	pushl	%ecx;						\
-	pushl	%edx;						\
-	call	EXT(_enable_preemption);			\
-	popl	%edx;						\
-	popl	%ecx;						\
-	popl	%eax
-#define ENABLE_PREEMPTION_NO_CHECK				\
-	pushl	%eax;						\
-	pushl	%ecx;						\
-	pushl	%edx;						\
-	call	EXT(_enable_preemption_no_check);		\
-	popl	%edx;						\
-	popl	%ecx;						\
-	popl	%eax
-#define MP_DISABLE_PREEMPTION					\
-	pushl	%eax;						\
-	pushl	%ecx;						\
-	pushl	%edx;						\
-	call	EXT(_mp_disable_preemption);			\
-	popl	%edx;						\
-	popl	%ecx;						\
-	popl	%eax
-#define MP_ENABLE_PREEMPTION					\
-	pushl	%eax;						\
-	pushl	%ecx;						\
-	pushl	%edx;						\
-	call	EXT(_mp_enable_preemption);			\
-	popl	%edx;						\
-	popl	%ecx;						\
-	popl	%eax
-#define MP_ENABLE_PREEMPTION_NO_CHECK				\
-	pushl	%eax;						\
-	pushl	%ecx;						\
-	pushl	%edx;						\
-	call	EXT(_mp_enable_preemption_no_check);		\
-	popl	%edx;						\
-	popl	%ecx;						\
-	popl	%eax
-#else	/* MACH_ASSERT */
 #define DISABLE_PREEMPTION		_DISABLE_PREEMPTION
 #define ENABLE_PREEMPTION		_ENABLE_PREEMPTION
 #define ENABLE_PREEMPTION_NO_CHECK	_ENABLE_PREEMPTION_NO_CHECK
 #define MP_DISABLE_PREEMPTION		_DISABLE_PREEMPTION
 #define MP_ENABLE_PREEMPTION		_ENABLE_PREEMPTION
 #define MP_ENABLE_PREEMPTION_NO_CHECK 	_ENABLE_PREEMPTION_NO_CHECK
-#endif	/* MACH_ASSERT */
 
 #else	/* MACH_RT */
 #define DISABLE_PREEMPTION

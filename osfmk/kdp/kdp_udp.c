@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2013 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -71,18 +71,22 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <libkern/version.h>
 
+extern unsigned int not_in_kdp;
+extern int kdp_snapshot;
+extern void do_stackshot(void);
+
+#ifdef CONFIG_KDP_INTERACTIVE_DEBUGGING
+
+extern int      inet_aton(const char *, struct kdp_in_addr *); /* in libkern */
+extern char    *inet_ntoa_r(struct kdp_in_addr ina, char *buf,
+    size_t buflen); /* in libkern */
+
 #define DO_ALIGN	1	      /* align all packet data accesses */
 #define KDP_SERIAL_IPADDR  0xABADBABE /* IP address used for serial KDP */
 #define LINK_UP_STATUS     (IFM_AVALID | IFM_ACTIVE)
 
 extern int kdp_getc(void);
 extern int reattach_wait;
-
-/* only used by IONetworkingFamily */
-typedef uint32_t (*kdp_link_t)(void);
-typedef boolean_t (*kdp_mode_t)(boolean_t);
-void 	kdp_register_link(kdp_link_t link, kdp_mode_t mode);
-void 	kdp_unregister_link(kdp_link_t link, kdp_mode_t mode);
 
 static u_short ip_id;                          /* ip packet ctr, for ids */
 
@@ -93,8 +97,123 @@ static u_short ip_id;                          /* ip packet ctr, for ids */
  * Per RFC 768, August, 1980.
  */
 #define UDP_TTL	60 /* deflt time to live for UDP packets */
-int	udp_ttl = UDP_TTL;
+static int udp_ttl = UDP_TTL;
 static unsigned char	exception_seq;
+
+struct kdp_ipovly {
+        uint32_t ih_next, ih_prev;	/* for protocol sequence q's */
+        u_char  ih_x1;			/* (unused) */
+        u_char  ih_pr;			/* protocol */
+        short   ih_len;			/* protocol length */
+        struct  kdp_in_addr ih_src;	/* source internet address */
+        struct  kdp_in_addr ih_dst;	/* destination internet address */
+};
+
+struct kdp_udphdr {
+	u_short uh_sport;		/* source port */
+	u_short uh_dport;		/* destination port */
+	short   uh_ulen;		/* udp length */
+	u_short uh_sum;			/* udp checksum */
+};
+
+struct  kdp_udpiphdr {
+        struct  kdp_ipovly ui_i;	/* overlaid ip structure */
+        struct  kdp_udphdr ui_u;	/* udp header */
+};
+#define	ui_next		ui_i.ih_next
+#define	ui_prev		ui_i.ih_prev
+#define	ui_x1		ui_i.ih_x1
+#define	ui_pr		ui_i.ih_pr
+#define	ui_len		ui_i.ih_len
+#define	ui_src		ui_i.ih_src
+#define	ui_dst		ui_i.ih_dst
+#define	ui_sport	ui_u.uh_sport
+#define	ui_dport	ui_u.uh_dport
+#define	ui_ulen		ui_u.uh_ulen
+#define	ui_sum		ui_u.uh_sum
+
+struct kdp_ip {
+	union {
+		uint32_t ip_w;
+		struct {
+			unsigned int
+#ifdef __LITTLE_ENDIAN__
+			ip_xhl:4,	/* header length */
+			ip_xv:4,	/* version */
+			ip_xtos:8,	/* type of service */
+			ip_xlen:16;	/* total length */
+#endif
+#ifdef __BIG_ENDIAN__
+			ip_xv:4,	/* version */
+			ip_xhl:4,	/* header length */
+			ip_xtos:8,	/* type of service */
+			ip_xlen:16;	/* total length */
+#endif
+		} ip_x;
+	} ip_vhltl;
+        u_short ip_id;			/* identification */
+        short   ip_off;			/* fragment offset field */
+#define	IP_DF 0x4000			/* dont fragment flag */
+#define	IP_MF 0x2000			/* more fragments flag */
+#define	IP_OFFMASK 0x1fff		/* mask for fragmenting bits */
+        u_char  ip_ttl;			/* time to live */
+        u_char  ip_p;			/* protocol */
+        u_short ip_sum;			/* checksum */
+        struct  kdp_in_addr ip_src,ip_dst;  /* source and dest address */
+};
+#define	ip_v		ip_vhltl.ip_x.ip_xv
+#define	ip_hl		ip_vhltl.ip_x.ip_xhl
+#define	ip_tos		ip_vhltl.ip_x.ip_xtos
+#define	ip_len		ip_vhltl.ip_x.ip_xlen
+
+#define	IPPROTO_UDP	17
+#define	IPVERSION	4
+
+#define	ETHERTYPE_IP	0x0800  /* IP protocol */
+
+/*
+ * Ethernet Address Resolution Protocol.
+ *
+ * See RFC 826 for protocol description.  Structure below is adapted
+ * to resolving internet addresses.  Field names used correspond to
+ * RFC 826.
+ */
+
+#define	ETHERTYPE_ARP	0x0806  /* Addr. resolution protocol */
+
+struct  kdp_arphdr {
+	u_short ar_hrd;         /* format of hardware address */
+#define	ARPHRD_ETHER    1       /* ethernet hardware format */
+#define	ARPHRD_FRELAY   15      /* frame relay hardware format */
+	u_short ar_pro;         /* format of protocol address */
+	u_char  ar_hln;         /* length of hardware address */
+	u_char  ar_pln;         /* length of protocol address */
+	u_short ar_op;          /* one of: */
+#define	ARPOP_REQUEST   1       /* request to resolve address */
+#define	ARPOP_REPLY     2       /* response to previous request */
+#define	ARPOP_REVREQUEST 3      /* request protocol address given hardware */
+#define	ARPOP_REVREPLY  4       /* response giving protocol address */
+#define	ARPOP_INVREQUEST 8      /* request to identify peer */
+#define	ARPOP_INVREPLY  9       /* response identifying peer */
+};
+
+struct  kdp_ether_arp {
+	struct  kdp_arphdr ea_hdr;		/* fixed-size header */
+	u_char  arp_sha[ETHER_ADDR_LEN];        /* sender hardware address */
+	u_char  arp_spa[4];			/* sender protocol address */
+	u_char  arp_tha[ETHER_ADDR_LEN];        /* target hardware address */
+	u_char  arp_tpa[4];			/* target protocol address */
+};
+#define	arp_hrd	ea_hdr.ar_hrd
+#define	arp_pro	ea_hdr.ar_pro
+#define	arp_hln	ea_hdr.ar_hln
+#define	arp_pln	ea_hdr.ar_pln
+#define	arp_op	ea_hdr.ar_op
+
+#define	ETHERMTU	1500
+#define	ETHERHDRSIZE	14
+#define	ETHERCRC	4
+#define	KDP_MAXPACKET	(ETHERHDRSIZE + ETHERMTU + ETHERCRC)
 
 static struct {
     unsigned char	data[KDP_MAXPACKET];
@@ -106,12 +225,12 @@ struct kdp_manual_pkt manual_pkt;
 
 struct {
     struct {
-	struct in_addr		in;
-	struct ether_addr	ea;
+	struct kdp_in_addr	in;
+	struct kdp_ether_addr	ea;
     } loc;
     struct {
-	struct in_addr		in;
-	struct ether_addr	ea;
+	struct kdp_in_addr	in;
+	struct kdp_ether_addr	ea;
     } rmt;
 } adr;
 
@@ -128,7 +247,7 @@ static const char
 
 volatile int kdp_flag = 0;
 
-static kdp_send_t    kdp_en_send_pkt;
+kdp_send_t    kdp_en_send_pkt;
 static kdp_receive_t kdp_en_recv_pkt;
 static kdp_link_t    kdp_en_linkstatus;
 static kdp_mode_t    kdp_en_setmode;
@@ -141,7 +260,7 @@ static void kdp_serial_send(void *rpkt, unsigned int rpkt_len);
 #endif
 
 static uint32_t kdp_current_ip_address = 0;
-static struct ether_addr kdp_current_mac_address = {{0, 0, 0, 0, 0, 0}};
+static struct kdp_ether_addr kdp_current_mac_address = {{0, 0, 0, 0, 0, 0}};
 static void *kdp_current_ifp;
 
 static void kdp_handler( void *);
@@ -158,12 +277,12 @@ static boolean_t router_specified = FALSE;
 static boolean_t corename_specified = FALSE;
 static unsigned int panicd_port = CORE_REMOTE_PORT;
 
-static struct ether_addr etherbroadcastaddr = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
+static struct kdp_ether_addr etherbroadcastaddr = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
 
-static struct ether_addr router_mac = {{0, 0, 0 , 0, 0, 0}};
-static struct ether_addr destination_mac = {{0, 0, 0 , 0, 0, 0}};
-static struct ether_addr temp_mac = {{0, 0, 0 , 0, 0, 0}};
-static struct ether_addr current_resolved_MAC = {{0, 0, 0 , 0, 0, 0}};
+static struct kdp_ether_addr router_mac = {{0, 0, 0 , 0, 0, 0}};
+static struct kdp_ether_addr destination_mac = {{0, 0, 0 , 0, 0, 0}};
+static struct kdp_ether_addr temp_mac = {{0, 0, 0 , 0, 0, 0}};
+static struct kdp_ether_addr current_resolved_MAC = {{0, 0, 0 , 0, 0, 0}};
 
 static boolean_t flag_panic_dump_in_progress = FALSE;
 static boolean_t flag_router_mac_initialized = FALSE;
@@ -177,7 +296,7 @@ static unsigned int last_panic_port = CORE_REMOTE_PORT;
 #define KDP_THROTTLE_VALUE       (10ULL * NSEC_PER_SEC)
 
 uint32_t kdp_crashdump_pkt_size = 512;
-#define KDP_LARGE_CRASHDUMP_PKT_SIZE (1440 - 6 - sizeof(struct udpiphdr))
+#define KDP_LARGE_CRASHDUMP_PKT_SIZE (1440 - 6 - sizeof(struct kdp_udpiphdr))
 static char panicd_ip_str[20];
 static char router_ip_str[20];
 static char corename_str[50];
@@ -186,7 +305,6 @@ static unsigned int panic_block = 0;
 volatile unsigned int kdp_trigger_core_dump = 0;
 __private_extern__ volatile unsigned int flag_kdp_trigger_reboot = 0;
 
-extern unsigned int not_in_kdp;
 
 extern unsigned int disableConsoleOutput;
 
@@ -194,18 +312,15 @@ extern void 		kdp_call(void);
 extern boolean_t 	kdp_call_kdb(void);
 extern int 		kern_dump(void);
 
-extern int inet_aton(const char *cp, struct in_addr *pin);
-extern int inet_ntoa2(struct in_addr * pin, char * cp, const int len);
-
 void *	kdp_get_interface(void);
 void    kdp_set_gateway_mac(void *gatewaymac);
-void 	kdp_set_ip_and_mac_addresses(struct in_addr *ipaddr, struct ether_addr *);
-void 	kdp_set_interface(void *interface, const struct ether_addr *macaddr);
+void 	kdp_set_ip_and_mac_addresses(struct kdp_in_addr *ipaddr, struct kdp_ether_addr *);
+void 	kdp_set_interface(void *interface, const struct kdp_ether_addr *macaddr);
 
 void 			kdp_disable_arp(void);
-static void 		kdp_arp_reply(struct ether_arp *);
-static void 		kdp_process_arp_reply(struct ether_arp *);
-static boolean_t 	kdp_arp_resolve(uint32_t, struct ether_addr *);
+static void 		kdp_arp_reply(struct kdp_ether_arp *);
+static void 		kdp_process_arp_reply(struct kdp_ether_arp *);
+static boolean_t 	kdp_arp_resolve(uint32_t, struct kdp_ether_addr *);
 
 static volatile unsigned	kdp_reentry_deadline;
 
@@ -217,42 +332,12 @@ char kdp_kernelversion_string[256];
 static boolean_t	gKDPDebug = FALSE;
 #define KDP_DEBUG(...) if (gKDPDebug) printf(__VA_ARGS__);
 
-int kdp_snapshot = 0;
-static int stack_snapshot_ret = 0;
-static unsigned stack_snapshot_bytes_traced = 0;
-
-static void *stack_snapshot_buf;
-static uint32_t stack_snapshot_bufsize;
-static int stack_snapshot_pid;
-static uint32_t stack_snapshot_flags;
-static uint32_t stack_snapshot_dispatch_offset;
-
-static unsigned int old_debugger;
-
 #define SBLOCKSZ (2048)
 uint64_t kdp_dump_start_time = 0;
 uint64_t kdp_min_superblock_dump_time = ~1ULL;
 uint64_t kdp_max_superblock_dump_time = 0;
 uint64_t kdp_superblock_dump_time = 0;
 uint64_t kdp_superblock_dump_start_time = 0;
-
-void
-kdp_snapshot_preflight(int pid, void * tracebuf, uint32_t tracebuf_size,
-    uint32_t flags, uint32_t dispatch_offset);
-
-void
-kdp_snapshot_postflight(void);
-
-extern int
-kdp_stackshot(int pid, void *tracebuf, uint32_t tracebuf_size,
-    uint32_t flags, uint32_t dispatch_offset, uint32_t *pbytesTraced);
-
-int
-kdp_stack_snapshot_geterror(void);
-
-int
-kdp_stack_snapshot_bytes_traced(void);
-
 static thread_call_t
 kdp_timer_call;
 
@@ -383,46 +468,6 @@ kdp_unregister_send_receive(
 	kdp_en_recv_pkt   = NULL;
 }
 
-/* Cache stack snapshot parameters in preparation for a trace */
-void
-kdp_snapshot_preflight(int pid, void * tracebuf, uint32_t tracebuf_size, uint32_t flags, uint32_t dispatch_offset)
-{
-	stack_snapshot_pid = pid;
-	stack_snapshot_buf = tracebuf;
-	stack_snapshot_bufsize = tracebuf_size;
-	stack_snapshot_flags = flags;
-	stack_snapshot_dispatch_offset = dispatch_offset;
-	kdp_snapshot++;
-	/* Mark this debugger as active, since the polled mode driver that 
-	 * ordinarily does this may not be enabled (yet), or since KDB may be
-	 * the primary debugger.
-	 */
-	old_debugger = current_debugger;
-	if (old_debugger != KDP_CUR_DB) {
-		current_debugger = KDP_CUR_DB;
-	}
-}
-
-void
-kdp_snapshot_postflight(void)
-{
-	kdp_snapshot--;
-	if ((kdp_en_send_pkt == NULL) || (old_debugger == KDB_CUR_DB))
-		current_debugger = old_debugger;
-}
-
-int
-kdp_stack_snapshot_geterror(void)
-{
-	return stack_snapshot_ret;
-}
-
-int
-kdp_stack_snapshot_bytes_traced(void)
-{
-	return stack_snapshot_bytes_traced;
-}
-
 static void
 kdp_schedule_debugger_reentry(unsigned interval) {
 	uint64_t deadline;;
@@ -437,7 +482,7 @@ enaddr_copy(
 	void	*dst
 )
 {
-	bcopy((char *)src, (char *)dst, sizeof (struct ether_addr));
+	bcopy((char *)src, (char *)dst, sizeof (struct kdp_ether_addr));
 }
 
 static unsigned short
@@ -468,26 +513,26 @@ kdp_reply(
           const boolean_t         sideband
           )
 {
-	struct udpiphdr		aligned_ui, *ui = &aligned_ui;
-	struct ip		aligned_ip, *ip = &aligned_ip;
-	struct in_addr		tmp_ipaddr;
-	struct ether_addr	tmp_enaddr;
-	struct ether_header	*eh = NULL;
+	struct kdp_udpiphdr	aligned_ui, *ui = &aligned_ui;
+	struct kdp_ip		aligned_ip, *ip = &aligned_ip;
+	struct kdp_in_addr	tmp_ipaddr;
+	struct kdp_ether_addr	tmp_enaddr;
+	struct kdp_ether_header	*eh = NULL;
     
 	if (!pkt.input)
 		kdp_panic("kdp_reply");
 	
-	pkt.off -= (unsigned int)sizeof (struct udpiphdr);
+	pkt.off -= (unsigned int)sizeof (struct kdp_udpiphdr);
 
 #if DO_ALIGN    
 	bcopy((char *)&pkt.data[pkt.off], (char *)ui, sizeof(*ui));
 #else
-	ui = (struct udpiphdr *)&pkt.data[pkt.off];
+	ui = (struct kdp_udpiphdr *)&pkt.data[pkt.off];
 #endif
 	ui->ui_next = ui->ui_prev = 0;
 	ui->ui_x1 = 0;
 	ui->ui_pr = IPPROTO_UDP;
-	ui->ui_len = htons((u_short)pkt.len + sizeof (struct udphdr));
+	ui->ui_len = htons((u_short)pkt.len + sizeof (struct kdp_udphdr));
 	tmp_ipaddr = ui->ui_src;
 	ui->ui_src = ui->ui_dst;
 	ui->ui_dst = tmp_ipaddr;
@@ -499,12 +544,12 @@ kdp_reply(
 	bcopy((char *)ui, (char *)&pkt.data[pkt.off], sizeof(*ui));
 	bcopy((char *)&pkt.data[pkt.off], (char *)ip, sizeof(*ip));
 #else
-	ip = (struct ip *)&pkt.data[pkt.off];
+	ip = (struct kdp_ip *)&pkt.data[pkt.off];
 #endif
-	ip->ip_len = htons(sizeof (struct udpiphdr) + pkt.len);
+	ip->ip_len = htons(sizeof (struct kdp_udpiphdr) + pkt.len);
 	ip->ip_v = IPVERSION;
 	ip->ip_id = htons(ip_id++);
-	ip->ip_hl = sizeof (struct ip) >> 2;
+	ip->ip_hl = sizeof (struct kdp_ip) >> 2;
 	ip->ip_ttl = udp_ttl;
 	ip->ip_sum = 0;
 	ip->ip_sum = htons(~ip_sum((unsigned char *)ip, ip->ip_hl));
@@ -512,17 +557,17 @@ kdp_reply(
 	bcopy((char *)ip, (char *)&pkt.data[pkt.off], sizeof(*ip));
 #endif
     
-	pkt.len += (unsigned int)sizeof (struct udpiphdr);
+	pkt.len += (unsigned int)sizeof (struct kdp_udpiphdr);
     
-	pkt.off -= (unsigned int)sizeof (struct ether_header);
+	pkt.off -= (unsigned int)sizeof (struct kdp_ether_header);
     
-	eh = (struct ether_header *)&pkt.data[pkt.off];
+	eh = (struct kdp_ether_header *)&pkt.data[pkt.off];
 	enaddr_copy(eh->ether_shost, &tmp_enaddr);
 	enaddr_copy(eh->ether_dhost, eh->ether_shost);
 	enaddr_copy(&tmp_enaddr, eh->ether_dhost);
 	eh->ether_type = htons(ETHERTYPE_IP);
     
-	pkt.len += (unsigned int)sizeof (struct ether_header);
+	pkt.len += (unsigned int)sizeof (struct kdp_ether_header);
     
 	// save reply for possible retransmission
 	assert(pkt.len <= KDP_MAXPACKET);
@@ -541,24 +586,24 @@ kdp_send(
     unsigned short		remote_port
 )
 {
-    struct udpiphdr		aligned_ui, *ui = &aligned_ui;
-    struct ip			aligned_ip, *ip = &aligned_ip;
-    struct ether_header		*eh;
+    struct kdp_udpiphdr		aligned_ui, *ui = &aligned_ui;
+    struct kdp_ip		aligned_ip, *ip = &aligned_ip;
+    struct kdp_ether_header	*eh;
     
     if (pkt.input)
 	kdp_panic("kdp_send");
 
-    pkt.off -= (unsigned int)sizeof (struct udpiphdr);
+    pkt.off -= (unsigned int)sizeof (struct kdp_udpiphdr);
 
 #if DO_ALIGN
     bcopy((char *)&pkt.data[pkt.off], (char *)ui, sizeof(*ui));
 #else
-    ui = (struct udpiphdr *)&pkt.data[pkt.off];
+    ui = (struct kdp_udpiphdr *)&pkt.data[pkt.off];
 #endif
     ui->ui_next = ui->ui_prev = 0;
     ui->ui_x1 = 0;
     ui->ui_pr = IPPROTO_UDP;
-    ui->ui_len = htons((u_short)pkt.len + sizeof (struct udphdr));
+    ui->ui_len = htons((u_short)pkt.len + sizeof (struct kdp_udphdr));
     ui->ui_src = adr.loc.in;
     ui->ui_dst = adr.rmt.in;
     ui->ui_sport = htons(KDP_REMOTE_PORT);
@@ -569,12 +614,12 @@ kdp_send(
     bcopy((char *)ui, (char *)&pkt.data[pkt.off], sizeof(*ui));
     bcopy((char *)&pkt.data[pkt.off], (char *)ip, sizeof(*ip));
 #else
-    ip = (struct ip *)&pkt.data[pkt.off];
+    ip = (struct kdp_ip *)&pkt.data[pkt.off];
 #endif
-    ip->ip_len = htons(sizeof (struct udpiphdr) + pkt.len);
+    ip->ip_len = htons(sizeof (struct kdp_udpiphdr) + pkt.len);
     ip->ip_v = IPVERSION;
     ip->ip_id = htons(ip_id++);
-    ip->ip_hl = sizeof (struct ip) >> 2;
+    ip->ip_hl = sizeof (struct kdp_ip) >> 2;
     ip->ip_ttl = udp_ttl;
     ip->ip_sum = 0;
     ip->ip_sum = htons(~ip_sum((unsigned char *)ip, ip->ip_hl));
@@ -582,16 +627,16 @@ kdp_send(
     bcopy((char *)ip, (char *)&pkt.data[pkt.off], sizeof(*ip));
 #endif
     
-    pkt.len += (unsigned int)sizeof (struct udpiphdr);
+    pkt.len += (unsigned int)sizeof (struct kdp_udpiphdr);
     
-    pkt.off -= (unsigned int)sizeof (struct ether_header);
+    pkt.off -= (unsigned int)sizeof (struct kdp_ether_header);
     
-    eh = (struct ether_header *)&pkt.data[pkt.off];
+    eh = (struct kdp_ether_header *)&pkt.data[pkt.off];
     enaddr_copy(&adr.loc.ea, eh->ether_shost);
     enaddr_copy(&adr.rmt.ea, eh->ether_dhost);
     eh->ether_type = htons(ETHERTYPE_IP);
     
-    pkt.len += (unsigned int)sizeof (struct ether_header);
+    pkt.len += (unsigned int)sizeof (struct kdp_ether_header);
     kdp_send_data(&pkt.data[pkt.off], pkt.len);
 }
 
@@ -612,10 +657,10 @@ inline static void debugger_if_necessary(void)
    when the interface gets initialized for real.
 */
 void
-kdp_set_interface(void *ifp, const struct ether_addr *macaddr)
+kdp_set_interface(void *ifp, const struct kdp_ether_addr *macaddr)
 {
 	char kdpstr[80];
-        struct in_addr addr = { 0 };
+        struct kdp_in_addr addr = { 0 };
         unsigned int len;
         
 	kdp_current_ifp = ifp;
@@ -662,8 +707,8 @@ kdp_get_interface(void)
 
 void 
 kdp_set_ip_and_mac_addresses(
-	struct in_addr		*ipaddr, 
-	struct ether_addr	*macaddr)
+	struct kdp_in_addr		*ipaddr, 
+	struct kdp_ether_addr	*macaddr)
 {
         static uint64_t last_time    = (uint64_t) -1;
         static uint64_t throttle_val = 0;
@@ -683,7 +728,7 @@ kdp_set_ip_and_mac_addresses(
         if (save_ip_in_nvram == FALSE)
             goto done;
 
-        if (inet_ntoa2(ipaddr, addr, sizeof(addr)) == FALSE)
+        if (inet_ntoa_r(*ipaddr, addr, sizeof(addr)) == NULL)
             goto done;
 
         /* throttle writes if needed */
@@ -705,11 +750,11 @@ done:
 void
 kdp_set_gateway_mac(void *gatewaymac)
 {
-    router_mac = *(struct ether_addr *)gatewaymac;
+    router_mac = *(struct kdp_ether_addr *)gatewaymac;
     flag_router_mac_initialized = TRUE;
 } 
 
-struct ether_addr 
+struct kdp_ether_addr 
 kdp_get_mac_addr(void)
 {
   return kdp_current_mac_address;
@@ -730,10 +775,10 @@ kdp_disable_arp(void)
 static void
 kdp_arp_dispatch(void)
 {
-	struct ether_arp	aligned_ea, *ea = &aligned_ea;
+	struct kdp_ether_arp	aligned_ea, *ea = &aligned_ea;
 	unsigned		arp_header_offset;
 
-	arp_header_offset = (unsigned)sizeof(struct ether_header) + pkt.off;
+	arp_header_offset = (unsigned)sizeof(struct kdp_ether_header) + pkt.off;
 	memcpy((void *)ea, (void *)&pkt.data[arp_header_offset], sizeof(*ea));
 
 	switch(ntohs(ea->arp_op)) {
@@ -749,18 +794,18 @@ kdp_arp_dispatch(void)
 }
 
 static void
-kdp_process_arp_reply(struct ether_arp *ea)
+kdp_process_arp_reply(struct kdp_ether_arp *ea)
 {
 	/* Are we interested in ARP replies? */
 	if (flag_arp_resolved == TRUE)
 		return;
 
 	/* Did we receive a reply from the right source? */
-	if (((struct in_addr *)(ea->arp_spa))->s_addr != target_ip)
+	if (((struct kdp_in_addr *)(ea->arp_spa))->s_addr != target_ip)
 	  return;
 
 	flag_arp_resolved = TRUE;
-	current_resolved_MAC = *(struct ether_addr *) (ea->arp_sha);
+	current_resolved_MAC = *(struct kdp_ether_addr *) (ea->arp_sha);
 
 	return;
 }
@@ -770,15 +815,15 @@ kdp_process_arp_reply(struct ether_arp *ea)
  */
 
 static void 
-kdp_arp_reply(struct ether_arp *ea)
+kdp_arp_reply(struct kdp_ether_arp *ea)
 {
-	struct ether_header	*eh;
+	struct kdp_ether_header	*eh;
 
-	struct in_addr 		isaddr, itaddr, myaddr;
-	struct ether_addr	my_enaddr;
+	struct kdp_in_addr 		isaddr, itaddr, myaddr;
+	struct kdp_ether_addr	my_enaddr;
 
-	eh = (struct ether_header *)&pkt.data[pkt.off];
-	pkt.off += (unsigned int)sizeof(struct ether_header);
+	eh = (struct kdp_ether_header *)&pkt.data[pkt.off];
+	pkt.off += (unsigned int)sizeof(struct kdp_ether_header);
 
 	if(ntohs(ea->arp_op) != ARPOP_REQUEST)
 	  return;
@@ -812,7 +857,7 @@ kdp_arp_reply(struct ether_arp *ea)
 		(void)memcpy(eh->ether_shost, &my_enaddr, sizeof(eh->ether_shost));
 		eh->ether_type = htons(ETHERTYPE_ARP);
 		(void)memcpy(&pkt.data[pkt.off], ea, sizeof(*ea));
-		pkt.off -= (unsigned int)sizeof (struct ether_header);
+		pkt.off -= (unsigned int)sizeof (struct kdp_ether_header);
 		/* pkt.len is still the length we want, ether_header+ether_arp */
 		kdp_send_data(&pkt.data[pkt.off], pkt.len);
 	}
@@ -821,9 +866,9 @@ kdp_arp_reply(struct ether_arp *ea)
 static void
 kdp_poll(void)
 {
-	struct ether_header	*eh = NULL;
-	struct udpiphdr		aligned_ui, *ui = &aligned_ui;
-	struct ip		aligned_ip, *ip = &aligned_ip;
+	struct kdp_ether_header	*eh = NULL;
+	struct kdp_udpiphdr	aligned_ui, *ui = &aligned_ui;
+	struct kdp_ip		aligned_ip, *ip = &aligned_ip;
 	static int		msg_printed;
 
 	if (pkt.input)
@@ -843,9 +888,9 @@ kdp_poll(void)
 	if (pkt.len == 0)
 		return;
 
-	if (pkt.len >= sizeof(struct ether_header))
+	if (pkt.len >= sizeof(struct kdp_ether_header))
 	{
-		eh = (struct ether_header *)&pkt.data[pkt.off];  
+		eh = (struct kdp_ether_header *)&pkt.data[pkt.off];  
 	
 		if (kdp_flag & KDP_ARP)
 		{
@@ -857,10 +902,10 @@ kdp_poll(void)
 		}
 	}
 
-	if (pkt.len < (sizeof (struct ether_header) + sizeof (struct udpiphdr)))
+	if (pkt.len < (sizeof (struct kdp_ether_header) + sizeof (struct kdp_udpiphdr)))
 		return;
 
-	pkt.off += (unsigned int)sizeof (struct ether_header);
+	pkt.off += (unsigned int)sizeof (struct kdp_ether_header);
 	if (ntohs(eh->ether_type) != ETHERTYPE_IP) {
 		return;
 	}
@@ -869,16 +914,16 @@ kdp_poll(void)
 	bcopy((char *)&pkt.data[pkt.off], (char *)ui, sizeof(*ui));
 	bcopy((char *)&pkt.data[pkt.off], (char *)ip, sizeof(*ip));
 #else
-	ui = (struct udpiphdr *)&pkt.data[pkt.off];
-	ip = (struct ip *)&pkt.data[pkt.off];
+	ui = (struct kdp_udpiphdr *)&pkt.data[pkt.off];
+	ip = (struct kdp_ip *)&pkt.data[pkt.off];
 #endif
 
-	pkt.off += (unsigned int)sizeof (struct udpiphdr);
+	pkt.off += (unsigned int)sizeof (struct kdp_udpiphdr);
 	if (ui->ui_pr != IPPROTO_UDP) {
 		return;
 	}
  
-	if (ip->ip_hl > (sizeof (struct ip) >> 2)) {
+	if (ip->ip_hl > (sizeof (struct kdp_ip) >> 2)) {
 		return;
 	}
 
@@ -914,7 +959,7 @@ kdp_poll(void)
 	/*
 	 * Calculate kdp packet length.
 	 */
-	pkt.len = ntohs((u_short)ui->ui_ulen) - (unsigned int)sizeof (struct udphdr);
+	pkt.len = ntohs((u_short)ui->ui_ulen) - (unsigned int)sizeof (struct kdp_udphdr);
 	pkt.input = TRUE;
 }
 
@@ -925,8 +970,8 @@ kdp_poll(void)
 static void
 transmit_ARP_request(uint32_t ip_addr)
 {
-	struct ether_header	*eh = (struct ether_header *) &pkt.data[0];
-	struct ether_arp	*ea = (struct ether_arp *) &pkt.data[sizeof(struct ether_header)];
+	struct kdp_ether_header	*eh = (struct kdp_ether_header *) &pkt.data[0];
+	struct kdp_ether_arp	*ea = (struct kdp_ether_arp *) &pkt.data[sizeof(struct kdp_ether_header)];
 
  	KDP_DEBUG("Transmitting ARP request\n");
 	/* Populate the ether_header */
@@ -950,13 +995,13 @@ transmit_ARP_request(uint32_t ip_addr)
 	memcpy(ea->arp_spa, (void *) &kdp_current_ip_address, sizeof(kdp_current_ip_address));
 
 	pkt.off = 0;
-	pkt.len = sizeof(struct ether_header) + sizeof(struct ether_arp);
+	pkt.len = sizeof(struct kdp_ether_header) + sizeof(struct kdp_ether_arp);
 	/* Transmit */
 	kdp_send_data(&pkt.data[pkt.off], pkt.len);
 }
 
 static boolean_t
-kdp_arp_resolve(uint32_t arp_target_ip, struct ether_addr *resolved_MAC)
+kdp_arp_resolve(uint32_t arp_target_ip, struct kdp_ether_addr *resolved_MAC)
 {
 	int poll_count = 256; /* ~770 ms modulo broadcast/delayed traffic? */
 	char tretries = 0;
@@ -1094,7 +1139,7 @@ static void
 kdp_connection_wait(void)
 {
 	unsigned short		reply_port;
-	struct ether_addr	kdp_mac_addr = kdp_get_mac_addr();
+	struct kdp_ether_addr	kdp_mac_addr = kdp_get_mac_addr();
 	unsigned int		ip_addr = ntohl(kdp_get_ip_address());
 
 	/*
@@ -1216,7 +1261,7 @@ kdp_send_exception(
     unsigned int                poll_timeout;
 
     do {
-	pkt.off = sizeof (struct ether_header) + sizeof (struct udpiphdr);
+	pkt.off = sizeof (struct kdp_ether_header) + sizeof (struct kdp_udpiphdr);
 	kdp_exception((unsigned char *)&pkt.data[pkt.off], 
 			(int *)&pkt.len, 
 			(unsigned short *)&remote_port,
@@ -1255,29 +1300,14 @@ kdp_send_exception(
     }
 }
 
-void
-kdp_raise_exception(
+static void 
+kdp_debugger_loop(
     unsigned int		exception,
     unsigned int		code,
     unsigned int		subcode,
-    void			*saved_state
-)
+    void			*saved_state)
 {
     int			index;
-    unsigned int	initial_not_in_kdp = not_in_kdp;
-
-    not_in_kdp = 0;
-    /* Was a system trace requested ? */
-    if (kdp_snapshot && (!panic_active()) && (panic_caller == 0)) {
-	    stack_snapshot_ret = kdp_stackshot(stack_snapshot_pid,
-	    stack_snapshot_buf, stack_snapshot_bufsize,
-	    stack_snapshot_flags, stack_snapshot_dispatch_offset, 
-		&stack_snapshot_bytes_traced);
-	    not_in_kdp = initial_not_in_kdp;
-	    return;
-    }
-
-    disable_preemption();
 
     if (saved_state == 0) 
 	printf("kdp_raise_exception with NULL state\n");
@@ -1321,7 +1351,7 @@ kdp_raise_exception(
 	kdp_panic_dump();
 
 	if (!(kdp_flag & DBG_POST_CORE))
-	  goto exit_raise_exception;
+	  goto exit_debugger_loop;
       }
 
  again:
@@ -1380,13 +1410,9 @@ kdp_raise_exception(
     if (reattach_wait == 1)
       goto again;
 
-exit_raise_exception:
+exit_debugger_loop:
     if (kdp_en_setmode)  
         (*kdp_en_setmode)(FALSE); /* link cleanup */
-
-    not_in_kdp = initial_not_in_kdp;
-
-    enable_preemption();
 }
 
 void
@@ -1404,28 +1430,28 @@ struct corehdr *
 create_panic_header(unsigned int request, const char *corename, 
     unsigned length, unsigned int block)
 {
-	struct udpiphdr		aligned_ui, *ui = &aligned_ui;
-	struct ip		aligned_ip, *ip = &aligned_ip;
-	struct ether_header	*eh;
+	struct kdp_udpiphdr	aligned_ui, *ui = &aligned_ui;
+	struct kdp_ip		aligned_ip, *ip = &aligned_ip;
+	struct kdp_ether_header	*eh;
 	struct corehdr		*coreh;
 	const char		*mode = "octet";
 	char			modelen  = strlen(mode) + 1;
 
 	size_t			fmask_size = sizeof(KDP_FEATURE_MASK_STRING) + sizeof(kdp_crashdump_feature_mask);
 
-	pkt.off = sizeof (struct ether_header);
+	pkt.off = sizeof (struct kdp_ether_header);
 	pkt.len = (unsigned int)(length + ((request == KDP_WRQ) ? modelen + fmask_size : 0) + 
 	(corename ? (strlen(corename) + 1 ): 0) + sizeof(struct corehdr));
 
 #if DO_ALIGN
 	bcopy((char *)&pkt.data[pkt.off], (char *)ui, sizeof(*ui));
 #else
-	ui = (struct udpiphdr *)&pkt.data[pkt.off];
+	ui = (struct kdp_udpiphdr *)&pkt.data[pkt.off];
 #endif
 	ui->ui_next = ui->ui_prev = 0;
 	ui->ui_x1 = 0;
 	ui->ui_pr = IPPROTO_UDP;
-	ui->ui_len = htons((u_short)pkt.len + sizeof (struct udphdr));
+	ui->ui_len = htons((u_short)pkt.len + sizeof (struct kdp_udphdr));
 	ui->ui_src.s_addr = (uint32_t)kdp_current_ip_address;
 	/* Already in network byte order via inet_aton() */
 	ui->ui_dst.s_addr = panic_server_ip;
@@ -1437,12 +1463,12 @@ create_panic_header(unsigned int request, const char *corename,
 	bcopy((char *)ui, (char *)&pkt.data[pkt.off], sizeof(*ui));
 	bcopy((char *)&pkt.data[pkt.off], (char *)ip, sizeof(*ip));
 #else
-	ip = (struct ip *)&pkt.data[pkt.off];
+	ip = (struct kdp_ip *)&pkt.data[pkt.off];
 #endif
-	ip->ip_len = htons(sizeof (struct udpiphdr) + pkt.len);
+	ip->ip_len = htons(sizeof (struct kdp_udpiphdr) + pkt.len);
 	ip->ip_v = IPVERSION;
 	ip->ip_id = htons(ip_id++);
-	ip->ip_hl = sizeof (struct ip) >> 2;
+	ip->ip_hl = sizeof (struct kdp_ip) >> 2;
 	ip->ip_ttl = udp_ttl;
 	ip->ip_sum = 0;
 	ip->ip_sum = htons(~ip_sum((unsigned char *)ip, ip->ip_hl));
@@ -1450,9 +1476,9 @@ create_panic_header(unsigned int request, const char *corename,
 	bcopy((char *)ip, (char *)&pkt.data[pkt.off], sizeof(*ip));
 #endif
     
-	pkt.len += (unsigned int)sizeof (struct udpiphdr);
+	pkt.len += (unsigned int)sizeof (struct kdp_udpiphdr);
 
-	pkt.off += (unsigned int)sizeof (struct udpiphdr);
+	pkt.off += (unsigned int)sizeof (struct kdp_udpiphdr);
   
 	coreh = (struct corehdr *) &pkt.data[pkt.off];
 	coreh->th_opcode = htons((u_short)request);
@@ -1479,15 +1505,15 @@ create_panic_header(unsigned int request, const char *corename,
 		coreh->th_block = htonl((unsigned int) block);
 	}
 
-	pkt.off -= (unsigned int)sizeof (struct udpiphdr);
-	pkt.off -= (unsigned int)sizeof (struct ether_header);
+	pkt.off -= (unsigned int)sizeof (struct kdp_udpiphdr);
+	pkt.off -= (unsigned int)sizeof (struct kdp_ether_header);
 
-	eh = (struct ether_header *)&pkt.data[pkt.off];
+	eh = (struct kdp_ether_header *)&pkt.data[pkt.off];
 	enaddr_copy(&kdp_current_mac_address, eh->ether_shost);
 	enaddr_copy(&destination_mac, eh->ether_dhost);
 	eh->ether_type = htons(ETHERTYPE_IP);
     
-	pkt.len += (unsigned int)sizeof (struct ether_header);
+	pkt.len += (unsigned int)sizeof (struct kdp_ether_header);
 	return coreh;
 }
 
@@ -1689,27 +1715,6 @@ static int
 isdigit (char c)
 {
   return ((c > 47) && (c < 58));
-}
-/* From user mode Libc - this ought to be in a library */
-static char *
-strnstr(char *s, const char *find, size_t slen)
-{
-  char c, sc;
-  size_t len;
-  
-  if ((c = *find++) != '\0') {
-    len = strlen(find);
-    do {
-      do {
-	if ((sc = *s++) == '\0' || slen-- < 1)
-	  return (NULL);
-      } while (sc != c);
-      if (len > slen)
-	return (NULL);
-    } while (strncmp(s, find, len) != 0);
-    s--;
-  }
-  return (s);
 }
 
 /* Horrid hack to extract xnu version if possible - a much cleaner approach
@@ -1918,7 +1923,7 @@ kdp_panic_dump(void)
 		      (unsigned int) (abstime & 0xffffffff));
         }
 
-	if (0 == inet_aton(panicd_ip_str, (struct in_addr *) &panic_server_ip)) {
+	if (0 == inet_aton(panicd_ip_str, (struct kdp_in_addr *) &panic_server_ip)) {
 		kdb_printf("inet_aton() failed interpreting %s as a panic server IP\n", panicd_ip_str);
 	}
 	else
@@ -1933,7 +1938,7 @@ kdp_panic_dump(void)
 	else {
 		if (!flag_panic_dump_in_progress) goto panic_dump_exit;
 		if (router_specified) {
-			if (0 == inet_aton(router_ip_str, (struct in_addr *) &parsed_router_ip))
+			if (0 == inet_aton(router_ip_str, (struct kdp_in_addr *) &parsed_router_ip))
 				kdb_printf("inet_aton() failed interpreting %s as an IP\n", router_ip_str);
 			else {
 				router_ip = parsed_router_ip;
@@ -1967,8 +1972,8 @@ kdp_panic_dump(void)
 	if ((panicstr != (char *) 0) && (kdp_flag & PANIC_LOG_DUMP)) {
 		kdb_printf_unbuffered("Transmitting panic log, please wait: ");
 		kdp_send_crashdump_data(KDP_DATA, corename_str, 
-					debug_buf_ptr - debug_buf,
-					debug_buf);
+					debug_buf_ptr - debug_buf_addr,
+					debug_buf_addr);
 		kdp_send_crashdump_pkt (KDP_EOF, NULL, 0, ((void *) 0));
 		printf("Please file a bug report on this panic, if possible.\n");
 		goto panic_dump_exit;
@@ -2068,7 +2073,8 @@ kdp_serial_setmode(boolean_t active)
 }
 
 
-static void kdp_serial_callout(__unused void *arg, kdp_event_t event)
+static void 
+kdp_serial_callout(__unused void *arg, kdp_event_t event)
 {
     /* When we stop KDP, set the bit to re-initialize the console serial port
      * the next time we send/receive a KDP packet.  We don't do it on
@@ -2098,19 +2104,19 @@ kdp_init(void)
 	strlcpy(kdp_kernelversion_string, version, sizeof(kdp_kernelversion_string));
 
 	/* Relies on platform layer calling panic_init() before kdp_init() */
-	if (kernel_uuid[0] != '\0') {
+	if (kernel_uuid_string[0] != '\0') {
 		/*
 		 * Update kdp_kernelversion_string with our UUID
 		 * generated at link time.
 		 */
 
 		strlcat(kdp_kernelversion_string, "; UUID=", sizeof(kdp_kernelversion_string));
-		strlcat(kdp_kernelversion_string, kernel_uuid, sizeof(kdp_kernelversion_string));
+		strlcat(kdp_kernelversion_string, kernel_uuid_string, sizeof(kdp_kernelversion_string));
 	}
 
-#if defined(__x86_64__) || defined(__arm__)
 	debug_log_init();
 
+#if defined(__x86_64__) || defined(__arm__) || defined(__arm64__)
 	if (vm_kernel_slide) {
 		char	KASLR_stext[19];
 		strlcat(kdp_kernelversion_string, "; stext=", sizeof(kdp_kernelversion_string));
@@ -2130,19 +2136,13 @@ kdp_init(void)
 
 #if CONFIG_SERIAL_KDP
 	char kdpname[80];
-	struct in_addr ipaddr;
-	struct ether_addr macaddr;
+	struct kdp_in_addr ipaddr;
+	struct kdp_ether_addr macaddr;
 
 
-#if CONFIG_EMBEDDED
-	//serial will be the debugger, unless match name is explicitly provided, and it's not "serial"
-	if(PE_parse_boot_argn("kdp_match_name", kdpname, sizeof(kdpname)) && strncmp(kdpname, "serial", sizeof(kdpname)) != 0)
-		return;
-#else
 	// serial must be explicitly requested
 	if(!PE_parse_boot_argn("kdp_match_name", kdpname, sizeof(kdpname)) || strncmp(kdpname, "serial", sizeof(kdpname)) != 0)
 		return;
-#endif
 	
 	kprintf("Initializing serial KDP\n");
 
@@ -2162,3 +2162,70 @@ kdp_init(void)
         
 #endif /* CONFIG_SERIAL_KDP */
 }
+
+#else /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+void
+kdp_init(void) 
+{
+}
+#endif /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+
+#if defined(__arm64__) || !CONFIG_KDP_INTERACTIVE_DEBUGGING
+static void
+panic_spin_forever() 
+{
+	kdb_printf("\nPlease go to https://panic.apple.com to report this panic\n");
+	for (;;) { }
+}
+#endif
+
+void
+kdp_raise_exception(
+    unsigned int		exception,
+    unsigned int		code,
+    unsigned int		subcode,
+    void			*saved_state
+)
+{
+    unsigned int	initial_not_in_kdp = not_in_kdp;
+
+    not_in_kdp = 0;
+    /* Was a system trace requested ? */
+    if (kdp_snapshot && (!panic_active()) && (panic_caller == 0)) {
+	    do_stackshot();
+	    not_in_kdp = initial_not_in_kdp;
+	    return;
+    }
+
+
+#if CONFIG_KDP_INTERACTIVE_DEBUGGING
+
+    if (current_debugger != KDP_CUR_DB) {
+        kdb_printf("\nDebugger not configured. Hanging.\n");
+        for (;;) { }
+    }
+
+    disable_preemption();
+
+    kdp_debugger_loop(exception, code, subcode, saved_state);
+    not_in_kdp = initial_not_in_kdp;
+    enable_preemption();
+#else /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+    assert(current_debugger != KDP_CUR_DB);
+
+    /* 
+     * If kernel debugging is enabled via boot-args, but KDP debugging
+     * is not compiled into the kernel, spin here waiting for debugging
+     * via another method.  Why here?  Because we want to have watchdog
+     * disabled (via KDP callout) while sitting waiting to be debugged.
+     */
+    panic_spin_forever();
+
+    (void)exception;
+    (void)code;
+    (void)subcode;
+    (void)saved_state;
+#endif /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+}
+
+

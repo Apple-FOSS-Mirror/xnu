@@ -164,6 +164,7 @@ ipc_space_create(
 	is_lock_init(space);
 	space->is_bits = 2; /* 2 refs, active, not growing */
 	space->is_table_size = new_size;
+	space->is_table_free = new_size - 1;
 	space->is_table = table;
 	space->is_table_next = initial+1;
 	space->is_task = NULL;
@@ -200,7 +201,14 @@ ipc_space_create_special(
 		return KERN_RESOURCE_SHORTAGE;
 
 	is_lock_init(space);
-	space->is_bits = IS_INACTIVE | 1; /* 1 ref, not active, not growing */
+
+	space->is_bits       = IS_INACTIVE | 1; /* 1 ref, not active, not growing */
+	space->is_table      = IE_NULL;
+	space->is_task       = TASK_NULL;
+	space->is_table_next = 0;
+	space->is_low_mod    = 0;
+	space->is_high_mod   = 0;
+
 	*spacep = space;
 	return KERN_SUCCESS;
 }
@@ -250,7 +258,7 @@ ipc_space_clean(
 		if (type != MACH_PORT_TYPE_NONE) {
 			mach_port_name_t name =	MACH_PORT_MAKE(index,
 						IE_BITS_GEN(entry->ie_bits));
-			ipc_right_destroy(space, name, entry); /* unlocks space */
+			ipc_right_destroy(space, name, entry, FALSE, 0); /* unlocks space */
 			goto retry;
 		}
 	}
@@ -325,6 +333,7 @@ ipc_space_terminate(
 
 	it_entries_free(space->is_table_next-1, table);
 	space->is_table_size = 0;
+	space->is_table_free = 0;
 
 	/*
 	 *	Because the space is now dead,

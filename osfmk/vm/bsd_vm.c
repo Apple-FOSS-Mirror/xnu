@@ -252,7 +252,7 @@ mach_macx_triggers(
 		}
 		/* trigger_port is locked and active */
 		ipc_port_make_send_locked(trigger_port); 
-		/* now unlocked */
+		ip_unlock(trigger_port);
 		default_pager_triggers(default_pager,
 					0, 0, 
 					SWAP_FILE_CREATION_ERROR,
@@ -266,7 +266,7 @@ mach_macx_triggers(
 		}
 		/* trigger_port is locked and active */
 		ipc_port_make_send_locked(trigger_port); 
-		/* now unlocked */
+		ip_unlock(trigger_port);
 		default_pager_triggers(default_pager, 
 				       hi_water, low_water,
 				       HI_WAT_ALERT, trigger_port);
@@ -279,7 +279,7 @@ mach_macx_triggers(
 		}
 		/* trigger_port is locked and active */
 		ipc_port_make_send_locked(trigger_port);
-		/* and now its unlocked */
+		ip_unlock(trigger_port);
 		default_pager_triggers(default_pager, 
 				       hi_water, low_water,
 				       LO_WAT_ALERT, trigger_port);
@@ -472,7 +472,7 @@ memory_object_control_uiomove(
 			if ((xsize = PAGE_SIZE - start_offset) > io_requested)
 			        xsize = io_requested;
 
-			if ( (retval = uiomove64((addr64_t)(((addr64_t)(dst_page->phys_page) << 12) + start_offset), xsize, uio)) )
+			if ( (retval = uiomove64((addr64_t)(((addr64_t)(dst_page->phys_page) << PAGE_SHIFT) + start_offset), xsize, uio)) )
 			        break;
 
 			io_requested -= xsize;
@@ -509,7 +509,8 @@ memory_object_control_uiomove(
 			 * update clustered and speculative state
 			 * 
 			 */
-			VM_PAGE_CONSUME_CLUSTERED(dst_page);
+			if (dst_page->clustered)
+				VM_PAGE_CONSUME_CLUSTERED(dst_page);
 
 			PAGE_WAKEUP_DONE(dst_page);
 		}
@@ -665,10 +666,9 @@ vnode_pager_get_isinuse(
 }
 
 kern_return_t
-vnode_pager_check_hard_throttle(
+vnode_pager_get_throttle_io_limit(
 	memory_object_t		mem_obj,
-	uint32_t		*limit,
-	uint32_t		hard_throttle)
+	uint32_t		*limit)
 {
 	vnode_pager_t	vnode_object;
 
@@ -677,7 +677,7 @@ vnode_pager_check_hard_throttle(
 
 	vnode_object = vnode_pager_lookup(mem_obj);
 
-	(void)vnode_pager_return_hard_throttle_limit(vnode_object->vnode_handle, limit, hard_throttle);
+	(void)vnode_pager_return_throttle_io_limit(vnode_object->vnode_handle, limit);
 	return KERN_SUCCESS;
 }
 
@@ -716,10 +716,13 @@ vnode_pager_get_object_size(
 }
 
 kern_return_t
-vnode_pager_get_object_pathname(
+vnode_pager_get_object_name(
 	memory_object_t		mem_obj,
 	char			*pathname,
-	vm_size_t		*length_p)
+	vm_size_t		pathname_len,
+	char			*filename,
+	vm_size_t		filename_len,
+	boolean_t		*truncated_path_p)
 {
 	vnode_pager_t	vnode_object;
 
@@ -729,15 +732,19 @@ vnode_pager_get_object_pathname(
 
 	vnode_object = vnode_pager_lookup(mem_obj);
 
-	return vnode_pager_get_pathname(vnode_object->vnode_handle,
-					pathname,
-					length_p);
+	return vnode_pager_get_name(vnode_object->vnode_handle,
+				    pathname,
+				    pathname_len,
+				    filename,
+				    filename_len,
+				    truncated_path_p);
 }
 
 kern_return_t
-vnode_pager_get_object_filename(
-	memory_object_t	mem_obj,
-	const char	**filename)
+vnode_pager_get_object_mtime(
+	memory_object_t		mem_obj,
+	struct timespec		*mtime,
+	struct timespec		*cs_mtime)
 {
 	vnode_pager_t	vnode_object;
 
@@ -747,8 +754,9 @@ vnode_pager_get_object_filename(
 
 	vnode_object = vnode_pager_lookup(mem_obj);
 
-	return vnode_pager_get_filename(vnode_object->vnode_handle,
-					filename);
+	return vnode_pager_get_mtime(vnode_object->vnode_handle,
+				     mtime,
+				     cs_mtime);
 }
 
 kern_return_t
@@ -806,7 +814,7 @@ vnode_pager_data_request(
 
 	vnode_object = vnode_pager_lookup(mem_obj);
 
-	size = MAX_UPL_TRANSFER * PAGE_SIZE;
+	size = MAX_UPL_TRANSFER_BYTES;
 	base_offset = offset;
 
 	if (memory_object_cluster_size(vnode_object->control_handle, &base_offset, &size, &io_streaming, fault_info) != KERN_SUCCESS)
@@ -957,7 +965,7 @@ vnode_pager_cluster_write(
 		        upl_flags |= UPL_KEEPCACHED;
 
 	        while (cnt) {
-			size = (cnt < (PAGE_SIZE * MAX_UPL_TRANSFER)) ? cnt : (PAGE_SIZE * MAX_UPL_TRANSFER); /* effective max */
+			size = (cnt < MAX_UPL_TRANSFER_BYTES) ? cnt : MAX_UPL_TRANSFER_BYTES; /* effective max */
 
 			assert((upl_size_t) size == size);
 			vnode_pageout(vnode_object->vnode_handle, 
@@ -989,7 +997,7 @@ vnode_pager_cluster_write(
 			 * and then clip the size to insure we
 			 * don't request past the end of the underlying file
 			 */
-		        size = PAGE_SIZE * MAX_UPL_TRANSFER;
+		        size = MAX_UPL_TRANSFER_BYTES;
 		        base_offset = offset & ~((signed)(size - 1));
 
 			if ((base_offset + size) > vnode_size)
@@ -1007,7 +1015,8 @@ vnode_pager_cluster_write(
 		}
 		assert((upl_size_t) size == size);
 	        vnode_pageout(vnode_object->vnode_handle,
-			      NULL, (upl_offset_t)(offset - base_offset), base_offset, (upl_size_t) size, UPL_VNODE_PAGER, NULL);
+			      NULL, (upl_offset_t)(offset - base_offset), base_offset, (upl_size_t) size,
+			      (upl_flags & UPL_IOSYNC) | UPL_VNODE_PAGER, NULL);
 	}
 }
 
@@ -1246,6 +1255,86 @@ fill_procregioninfo(task_t task, uint64_t arg, struct proc_regioninfo_internal *
 	    return(1);
 }
 
+int
+fill_procregioninfo_onlymappedvnodes(task_t task, uint64_t arg, struct proc_regioninfo_internal *pinfo, uintptr_t *vnodeaddr, uint32_t  *vid)
+{
+
+	vm_map_t map;
+	vm_map_offset_t	address = (vm_map_offset_t )arg;
+	vm_map_entry_t		tmp_entry;
+	vm_map_entry_t		entry;
+
+	task_lock(task);
+	map = task->map;
+	if (map == VM_MAP_NULL) 
+	{
+		task_unlock(task);
+		return(0);
+	}
+	vm_map_reference(map); 
+	task_unlock(task);
+	
+	vm_map_lock_read(map);
+
+	if (!vm_map_lookup_entry(map, address, &tmp_entry)) {
+		if ((entry = tmp_entry->vme_next) == vm_map_to_entry(map)) {
+			vm_map_unlock_read(map);
+			vm_map_deallocate(map); 
+		   	return(0);
+		}
+	} else {
+		entry = tmp_entry;
+	}
+
+	while ((entry != vm_map_to_entry(map))) {
+		*vnodeaddr = 0;
+		*vid = 0;
+
+		if (entry->is_sub_map == 0) {
+			if (fill_vnodeinfoforaddr(entry, vnodeaddr, vid)) {
+
+				pinfo->pri_offset = entry->offset;
+				pinfo->pri_protection = entry->protection;
+				pinfo->pri_max_protection = entry->max_protection;
+				pinfo->pri_inheritance = entry->inheritance;
+				pinfo->pri_behavior = entry->behavior;
+				pinfo->pri_user_wired_count = entry->user_wired_count;
+				pinfo->pri_user_tag = entry->alias;
+				
+				if (entry->is_shared)
+					pinfo->pri_flags |= PROC_REGION_SHARED;
+				
+				pinfo->pri_pages_resident = 0;
+				pinfo->pri_pages_shared_now_private = 0;
+				pinfo->pri_pages_swapped_out = 0;
+				pinfo->pri_pages_dirtied = 0;
+				pinfo->pri_ref_count = 0;
+				pinfo->pri_shadow_depth = 0;
+				pinfo->pri_share_mode = 0;
+				
+				pinfo->pri_private_pages_resident = 0;
+				pinfo->pri_shared_pages_resident = 0;
+				pinfo->pri_obj_id = 0;
+				
+				pinfo->pri_address = (uint64_t)entry->vme_start;
+				pinfo->pri_size = (uint64_t)(entry->vme_end - entry->vme_start);
+				pinfo->pri_depth = 0;
+	
+				vm_map_unlock_read(map);
+				vm_map_deallocate(map); 
+				return(1);
+			}
+		}
+
+		/* Keep searching for a vnode-backed mapping */
+		entry = entry->vme_next;
+	}
+
+	vm_map_unlock_read(map);
+	vm_map_deallocate(map); 
+	return(0);
+}
+
 static int
 fill_vnodeinfoforaddr(
 	vm_map_entry_t			entry,
@@ -1330,6 +1419,23 @@ vnode_pager_get_object_vnode (
 	return(KERN_FAILURE);
 }
 
+#if CONFIG_IOSCHED
+kern_return_t
+vnode_pager_get_object_devvp(
+	memory_object_t 	mem_obj,
+	uintptr_t 		*devvp)
+{
+	struct vnode 	*vp;
+	uint32_t 	vid;
+
+	if(vnode_pager_get_object_vnode(mem_obj, (uintptr_t *)&vp, (uint32_t *)&vid) != KERN_SUCCESS)
+		return (KERN_FAILURE);
+	*devvp = (uintptr_t)vnode_mountdevvp(vp);
+	if (*devvp)
+		return (KERN_SUCCESS);	
+	return (KERN_FAILURE);
+}
+#endif
 
 /*
  * Find the underlying vnode object for the given vm_map_entry.  If found, return with the

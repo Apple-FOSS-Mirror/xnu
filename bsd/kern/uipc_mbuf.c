@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998-2012 Apple Inc. All rights reserved.
+ * Copyright (c) 1998-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -79,6 +79,8 @@
 #include <sys/queue.h>
 #include <sys/proc.h>
 
+#include <dev/random/randomdev.h>
+
 #include <kern/kern_types.h>
 #include <kern/simple_lock.h>
 #include <kern/queue.h>
@@ -87,6 +89,7 @@
 #include <kern/zalloc.h>
 
 #include <libkern/OSAtomic.h>
+#include <libkern/OSDebug.h>
 #include <libkern/libkern.h>
 
 #include <IOKit/IOMapper.h>
@@ -99,6 +102,7 @@
 #endif /* MAC_NET */
 
 #include <sys/mcache.h>
+#include <net/ntstat.h>
 
 /*
  * MBUF IMPLEMENTATION NOTES.
@@ -416,17 +420,41 @@ typedef struct {
 	mcache_audit_t	*cl_audit[NMBPBG];	/* array of audits */
 } mcl_audit_t;
 
-/*
- * Size of data from the beginning of an mbuf that covers m_hdr, pkthdr
- * and m_ext structures.  If auditing is enabled, we allocate a shadow
- * mbuf structure of this size inside each audit structure, and the
- * contents of the real mbuf gets copied into it when the mbuf is freed.
- * This allows us to pattern-fill the mbuf for integrity check, and to
- * preserve any constructed mbuf fields (e.g. mbuf + cluster cache case).
- * Note that we don't save the contents of clusters when they are freed;
- * we simply pattern-fill them.
- */
-#define	AUDIT_CONTENTS_SIZE	((MSIZE - MHLEN) + sizeof (_m_ext_t))
+typedef struct {
+	struct thread	*msa_thread;	/* thread doing transaction */
+	struct thread	*msa_pthread;	/* previous transaction thread */
+	uint32_t	msa_tstamp;	/* transaction timestamp (ms) */
+	uint32_t	msa_ptstamp;	/* prev transaction timestamp (ms) */
+	uint16_t	msa_depth;	/* pc stack depth */
+	uint16_t	msa_pdepth;	/* previous transaction pc stack */
+	void		*msa_stack[MCACHE_STACK_DEPTH];
+	void		*msa_pstack[MCACHE_STACK_DEPTH];
+} mcl_scratch_audit_t;
+
+typedef struct {
+	/*
+	 * Size of data from the beginning of an mbuf that covers m_hdr,
+	 * pkthdr and m_ext structures.  If auditing is enabled, we allocate
+	 * a shadow mbuf structure of this size inside each audit structure,
+	 * and the contents of the real mbuf gets copied into it when the mbuf
+	 * is freed.  This allows us to pattern-fill the mbuf for integrity
+	 * check, and to preserve any constructed mbuf fields (e.g. mbuf +
+	 * cluster cache case).  Note that we don't save the contents of
+	 * clusters when they are freed; we simply pattern-fill them.
+	 */
+	u_int8_t		sc_mbuf[(MSIZE - _MHLEN) + sizeof (_m_ext_t)];
+	mcl_scratch_audit_t	sc_scratch __attribute__((aligned(8)));
+} mcl_saved_contents_t;
+
+#define	AUDIT_CONTENTS_SIZE	(sizeof (mcl_saved_contents_t))
+
+#define	MCA_SAVED_MBUF_PTR(_mca)					\
+	((struct mbuf *)(void *)((mcl_saved_contents_t *)		\
+	(_mca)->mca_contents)->sc_mbuf)
+#define	MCA_SAVED_MBUF_SIZE						\
+	(sizeof (((mcl_saved_contents_t *)0)->sc_mbuf))
+#define	MCA_SAVED_SCRATCH_PTR(_mca)					\
+	(&((mcl_saved_contents_t *)(_mca)->mca_contents)->sc_scratch)
 
 /*
  * mbuf specific mcache audit flags
@@ -459,6 +487,8 @@ static boolean_t mclverify;	/* debug: pattern-checking */
 static boolean_t mcltrace;	/* debug: stack tracing */
 static boolean_t mclfindleak;	/* debug: leak detection */
 static boolean_t mclexpleak;	/* debug: expose leak info to user space */
+
+static struct timeval mb_start;	/* beginning of time */
 
 /* mbuf leak detection variables */
 static struct mleak_table mleak_table;
@@ -530,9 +560,6 @@ static lck_grp_attr_t *mleak_lock_grp_attr;
 
 extern u_int32_t high_sb_max;
 
-/* TODO: should be in header file */
-int do_reclaim = 0;
-
 /* The minimum number of objects that are allocated, to start. */
 #define	MINCL		32
 #define	MINBIGCL	(MINCL >> 1)
@@ -552,6 +579,7 @@ typedef struct {
 	int		mtbl_minlimit;	/* minimum allowed */
 	int		mtbl_maxlimit;	/* maximum allowed */
 	u_int32_t	mtbl_wantpurge;	/* purge during next reclaim */
+	uint32_t	mtbl_avgtotal;  /* average total on iOS */
 } mbuf_table_t;
 
 #define	m_class(c)	mbuf_table[c].mtbl_class
@@ -562,6 +590,7 @@ typedef struct {
 #define	m_minlimit(c)	mbuf_table[c].mtbl_minlimit
 #define	m_maxlimit(c)	mbuf_table[c].mtbl_maxlimit
 #define	m_wantpurge(c)	mbuf_table[c].mtbl_wantpurge
+#define	m_avgtotal(c)	mbuf_table[c].mtbl_avgtotal
 #define	m_cname(c)	mbuf_table[c].mtbl_stats->mbcl_cname
 #define	m_size(c)	mbuf_table[c].mtbl_stats->mbcl_size
 #define	m_total(c)	mbuf_table[c].mtbl_stats->mbcl_total
@@ -574,19 +603,23 @@ typedef struct {
 #define	m_purge_cnt(c)	mbuf_table[c].mtbl_stats->mbcl_purge_cnt
 #define	m_fail_cnt(c)	mbuf_table[c].mtbl_stats->mbcl_fail_cnt
 #define	m_ctotal(c)	mbuf_table[c].mtbl_stats->mbcl_ctotal
+#define	m_peak(c)	mbuf_table[c].mtbl_stats->mbcl_peak_reported
+#define	m_release_cnt(c) mbuf_table[c].mtbl_stats->mbcl_release_cnt
 
 static mbuf_table_t mbuf_table[] = {
 	/*
 	 * The caches for mbufs, regular clusters and big clusters.
+	 * The average total values were based on data gathered by actual
+	 * usage patterns on iOS.
 	 */
 	{ MC_MBUF, NULL, TAILQ_HEAD_INITIALIZER(m_slablist(MC_MBUF)),
-	    NULL, NULL, 0, 0, 0, 0 },
+	    NULL, NULL, 0, 0, 0, 0, 3000 },
 	{ MC_CL, NULL, TAILQ_HEAD_INITIALIZER(m_slablist(MC_CL)),
-	    NULL, NULL, 0, 0, 0, 0 },
+	    NULL, NULL, 0, 0, 0, 0, 2000 },
 	{ MC_BIGCL, NULL, TAILQ_HEAD_INITIALIZER(m_slablist(MC_BIGCL)),
-	    NULL, NULL, 0, 0, 0, 0 },
+	    NULL, NULL, 0, 0, 0, 0, 1000 },
 	{ MC_16KCL, NULL, TAILQ_HEAD_INITIALIZER(m_slablist(MC_16KCL)),
-	    NULL, NULL, 0, 0, 0, 0 },
+	    NULL, NULL, 0, 0, 0, 0, 1000 },
 	/*
 	 * The following are special caches; they serve as intermediate
 	 * caches backed by the above rudimentary caches.  Each object
@@ -595,15 +628,21 @@ static mbuf_table_t mbuf_table[] = {
 	 * deal with the slab structures; instead, the constructed
 	 * cached elements are simply stored in the freelists.
 	 */
-	{ MC_MBUF_CL, NULL, { NULL, NULL }, NULL, NULL, 0, 0, 0, 0 },
-	{ MC_MBUF_BIGCL, NULL, { NULL, NULL }, NULL, NULL, 0, 0, 0, 0 },
-	{ MC_MBUF_16KCL, NULL, { NULL, NULL }, NULL, NULL, 0, 0, 0, 0 },
+	{ MC_MBUF_CL, NULL, { NULL, NULL }, NULL, NULL, 0, 0, 0, 0, 2000 },
+	{ MC_MBUF_BIGCL, NULL, { NULL, NULL }, NULL, NULL, 0, 0, 0, 0, 1000 },
+	{ MC_MBUF_16KCL, NULL, { NULL, NULL }, NULL, NULL, 0, 0, 0, 0, 1000 },
 };
 
 #define	NELEM(a)	(sizeof (a) / sizeof ((a)[0]))
 
 static void *mb_waitchan = &mbuf_table;	/* wait channel for all caches */
 static int mb_waiters;			/* number of waiters */
+
+boolean_t mb_peak_newreport = FALSE;
+boolean_t mb_peak_firstreport = FALSE;
+
+/* generate a report by default after 1 week of uptime */
+#define	MBUF_PEAK_FIRST_REPORT_THRESHOLD	604800
 
 #define	MB_WDT_MAXTIME	10		/* # of secs before watchdog panic */
 static struct timeval mb_wdtstart;	/* watchdog start timestamp */
@@ -614,12 +653,17 @@ static char *mbuf_dump_buf;
 /*
  * mbuf watchdog is enabled by default on embedded platforms.  It is
  * also toggeable via the kern.ipc.mb_watchdog sysctl.
+ * Garbage collection is also enabled by default on embedded platforms.
+ * mb_drain_maxint controls the amount of time to wait (in seconds) before
+ * consecutive calls to m_drain().
  */
-#if CONFIG_EMBEDDED
-static unsigned int mb_watchdog = 1;
-#else
 static unsigned int mb_watchdog = 0;
-#endif /* CONFIG_EMBEDDED */
+static unsigned int mb_drain_maxint = 0;
+
+/* Red zone */
+static u_int32_t mb_redzone_cookie;
+static void m_redzone_init(struct mbuf *);
+static void m_redzone_verify(struct mbuf *m);
 
 /* The following are used to serialize m_clalloc() */
 static boolean_t mb_clalloc_busy;
@@ -664,12 +708,14 @@ static boolean_t mbuf_sleep(mbuf_class_t, unsigned int, int);
 
 static void mcl_audit_init(void *, mcache_audit_t **, mcache_obj_t **,
     size_t, unsigned int);
+static void mcl_audit_free(void *, unsigned int);
 static mcache_audit_t *mcl_audit_buf2mca(mbuf_class_t, mcache_obj_t *);
 static void mcl_audit_mbuf(mcache_audit_t *, void *, boolean_t, boolean_t);
 static void mcl_audit_cluster(mcache_audit_t *, void *, size_t, boolean_t,
     boolean_t);
 static void mcl_audit_restore_mbuf(struct mbuf *, mcache_audit_t *, boolean_t);
 static void mcl_audit_save_mbuf(struct mbuf *, mcache_audit_t *);
+static void mcl_audit_scratch(mcache_audit_t *);
 static void mcl_audit_mcheck_panic(struct mbuf *);
 static void mcl_audit_verify_nextptr(void *, mcache_audit_t *);
 
@@ -692,6 +738,8 @@ static boolean_t slab_is_detached(mcl_slab_t *);
 
 static int m_copyback0(struct mbuf **, int, int, const void *, int, int);
 static struct mbuf *m_split0(struct mbuf *, int, int, int);
+__private_extern__ void mbuf_report_peak_usage(void);
+static boolean_t mbuf_report_usage(mbuf_class_t);
 
 /* flags for m_copyback0 */
 #define	M_COPYBACK0_COPYBACK	0x0001	/* copyback from cp */
@@ -772,6 +820,19 @@ static struct mbuf *m_split0(struct mbuf *, int, int, int);
 /*
  * Macros used during mbuf and cluster initialization.
  */
+#define	MBUF_INIT_PKTHDR(m) {						\
+	(m)->m_pkthdr.rcvif = NULL;					\
+	(m)->m_pkthdr.pkt_hdr = NULL;					\
+	(m)->m_pkthdr.len = 0;						\
+	(m)->m_pkthdr.csum_flags = 0;					\
+	(m)->m_pkthdr.csum_data = 0;					\
+	(m)->m_pkthdr.vlan_tag = 0;					\
+	m_classifier_init(m, 0);					\
+	m_tag_init(m, 1);						\
+	m_scratch_init(m);						\
+	m_redzone_init(m);						\
+}
+
 #define	MBUF_INIT(m, pkthdr, type) {					\
 	_MCHECK(m);							\
 	(m)->m_next = (m)->m_nextpkt = NULL;				\
@@ -783,18 +844,7 @@ static struct mbuf *m_split0(struct mbuf *, int, int, int);
 	} else {							\
 		(m)->m_data = (m)->m_pktdat;				\
 		(m)->m_flags = M_PKTHDR;				\
-		(m)->m_pkthdr.rcvif = NULL;				\
-		(m)->m_pkthdr.len = 0;					\
-		(m)->m_pkthdr.header = NULL;				\
-		(m)->m_pkthdr.csum_flags = 0;				\
-		(m)->m_pkthdr.csum_data = 0;				\
-		(m)->m_pkthdr.tso_segsz = 0;				\
-		(m)->m_pkthdr.vlan_tag = 0;				\
-		(m)->m_pkthdr.socket_id = 0;				\
-		(m)->m_pkthdr.vt_nrecs = 0;				\
-		(m)->m_pkthdr.aux_flags = 0;				\
-		m_tag_init(m);						\
-		m_service_class_init(m);				\
+		MBUF_INIT_PKTHDR(m);					\
 	}								\
 }
 
@@ -868,7 +918,7 @@ struct mbstat mbstat;
  */
 typedef struct {
 	unsigned int	cpu_mtypes[MT_MAX];
-} __attribute__((aligned(CPU_CACHE_SIZE), packed)) mtypes_cpu_t;
+} __attribute__((aligned(MAX_CPU_CACHE_LINE_SIZE), packed)) mtypes_cpu_t;
 
 typedef struct {
 	mtypes_cpu_t	mbs_cpu[1];
@@ -1034,6 +1084,7 @@ mb_stat_sysctl SYSCTL_HANDLER_ARGS
 			oc->mbcl_purge_cnt = c->mbcl_purge_cnt;
 			oc->mbcl_fail_cnt = c->mbcl_fail_cnt;
 			oc->mbcl_ctotal = c->mbcl_ctotal;
+			oc->mbcl_release_cnt = c->mbcl_release_cnt;
 			oc->mbcl_mc_state = c->mbcl_mc_state;
 			oc->mbcl_mc_cached = c->mbcl_mc_cached;
 			oc->mbcl_mc_waiter_cnt = c->mbcl_mc_waiter_cnt;
@@ -1314,6 +1365,8 @@ mbinit(void)
 	void *buf;
 	thread_t thread = THREAD_NULL;
 
+	microuptime(&mb_start);
+
 	/*
 	 * These MBUF_ values must be equal to their private counterparts.
 	 */
@@ -1347,7 +1400,7 @@ mbinit(void)
 
 	_CASSERT(MBUF_TSO_IPV4 == CSUM_TSO_IPV4);
 	_CASSERT(MBUF_TSO_IPV6 == CSUM_TSO_IPV6);
-	_CASSERT(MBUF_CSUM_REQ_SUM16 == CSUM_TCP_SUM16);
+	_CASSERT(MBUF_CSUM_REQ_SUM16 == CSUM_PARTIAL);
 	_CASSERT(MBUF_CSUM_TCP_SUM16 == MBUF_CSUM_REQ_SUM16);
 	_CASSERT(MBUF_CSUM_REQ_IP == CSUM_IP);
 	_CASSERT(MBUF_CSUM_REQ_TCP == CSUM_TCP);
@@ -1362,9 +1415,6 @@ mbinit(void)
 	_CASSERT(MBUF_WAITOK == M_WAIT);
 	_CASSERT(MBUF_DONTWAIT == M_DONTWAIT);
 	_CASSERT(MBUF_COPYALL == M_COPYALL);
-
-	_CASSERT(MBUF_PKTAUXF_INET_RESOLVE_RTR == MAUXF_INET_RESOLVE_RTR);
-	_CASSERT(MBUF_PKTAUXF_INET6_RESOLVE_RTR == MAUXF_INET6_RESOLVE_RTR);
 
 	_CASSERT(MBUF_SC2TC(MBUF_SC_BK_SYS) == MBUF_TC_BK);
 	_CASSERT(MBUF_SC2TC(MBUF_SC_BK) == MBUF_TC_BK);
@@ -1381,6 +1431,18 @@ mbinit(void)
 	_CASSERT(MBUF_TC2SCVAL(MBUF_TC_BE) == SCVAL_BE);
 	_CASSERT(MBUF_TC2SCVAL(MBUF_TC_VI) == SCVAL_VI);
 	_CASSERT(MBUF_TC2SCVAL(MBUF_TC_VO) == SCVAL_VO);
+
+	/* Module specific scratch space (32-bit alignment requirement) */
+	_CASSERT(!(offsetof(struct mbuf, m_pkthdr.pkt_mpriv) %
+	    sizeof (uint32_t)));
+
+	/* Initialize random red zone cookie value */
+	_CASSERT(sizeof (mb_redzone_cookie) ==
+	    sizeof (((struct pkthdr *)0)->redzone));
+	read_random(&mb_redzone_cookie, sizeof (mb_redzone_cookie));
+
+	/* Make sure we don't save more than we should */
+	_CASSERT(MCA_SAVED_MBUF_SIZE <= sizeof (struct mbuf));
 
 	if (nmbclusters == 0)
 		nmbclusters = NMBCLUSTERS;
@@ -1427,7 +1489,7 @@ mbinit(void)
 		VERIFY(mclaudit != NULL);
 
 		mcl_audit_con_cache = mcache_create("mcl_audit_contents",
-		    AUDIT_CONTENTS_SIZE, 0, 0, MCR_SLEEP);
+		    AUDIT_CONTENTS_SIZE, sizeof (u_int64_t), 0, MCR_SLEEP);
 		VERIFY(mcl_audit_con_cache != NULL);
 	}
 	mclverify = (mbuf_debug & MCF_VERIFY);
@@ -1483,7 +1545,11 @@ mbinit(void)
 		/* Make sure we didn't miss any */
 		VERIFY(m_minlimit(m_class(m)) == 0 ||
 		    m_total(m_class(m)) >= m_minlimit(m_class(m)));
+
+		/* populate the initial sizes and report from there on */
+		m_peak(m_class(m)) = m_total(m_class(m));
 	}
+	mb_peak_newreport = FALSE;
 
 	lck_mtx_unlock(mbuf_mlock);
 
@@ -1538,11 +1604,12 @@ mbinit(void)
 	 * before alignment is not saved.
 	 */
 	ncpu = ml_get_max_cpus();
-	MALLOC(buf, void *, MBUF_MTYPES_SIZE(ncpu) + CPU_CACHE_SIZE,
+	MALLOC(buf, void *, MBUF_MTYPES_SIZE(ncpu) + CPU_CACHE_LINE_SIZE,
 	    M_TEMP, M_WAITOK);
 	VERIFY(buf != NULL);
 
-	mbuf_mtypes = (mbuf_mtypes_t *)P2ROUNDUP((intptr_t)buf, CPU_CACHE_SIZE);
+	mbuf_mtypes = (mbuf_mtypes_t *)P2ROUNDUP((intptr_t)buf,
+	    CPU_CACHE_LINE_SIZE);
 	bzero(mbuf_mtypes, MBUF_MTYPES_SIZE(ncpu));
 
 	/*
@@ -1570,7 +1637,12 @@ mbinit(void)
 	MALLOC(mbuf_dump_buf, char *, MBUF_DUMP_BUF_SIZE, M_TEMP, M_WAITOK);
 	VERIFY(mbuf_dump_buf != NULL);
 
-	printf("mbinit: done [%d MB total pool size, (%d/%d) split]\n",
+	if (mbuf_debug & MCF_DEBUG) {
+		printf("%s: MLEN %d, MHLEN %d\n", __func__,
+		    (int)_MLEN, (int)_MHLEN);
+	}
+
+	printf("%s: done [%d MB total pool size, (%d/%d) split]\n", __func__,
 	    (nmbclusters << MCLSHIFT) >> MBSHIFT,
 	    (nclusters << MCLSHIFT) >> MBSHIFT,
 	    (njcl << MCLSHIFT) >> MBSHIFT);
@@ -2060,7 +2132,7 @@ mbuf_slab_audit(void *arg, mcache_obj_t *list, boolean_t alloc)
 		}
 		/* Record this transaction */
 		if (mcltrace)
-			mcache_buffer_log(mca, list, m_cache(class));
+			mcache_buffer_log(mca, list, m_cache(class), &mb_start);
 
 		if (alloc)
 			mca->mca_uflags |= MB_INUSE;
@@ -2202,7 +2274,7 @@ cslab_free(mbuf_class_t class, mcache_obj_t *list, int purged)
 				mcache_audit_free_verify(mca, m, 0,
 				    m_maxsize(MC_MBUF));
 			}
-			ms = (struct mbuf *)mca->mca_contents;
+			ms = MCA_SAVED_MBUF_PTR(mca);
 		}
 
 		/* Do the cluster sanity checks */
@@ -2413,7 +2485,7 @@ mbuf_cslab_alloc(void *arg, mcache_obj_t ***plist, unsigned int needed,
 
 			lck_mtx_lock(mbuf_mlock);
 			mca = mcl_audit_buf2mca(MC_MBUF, (mcache_obj_t *)m);
-			ms = ((struct mbuf *)mca->mca_contents);
+			ms = MCA_SAVED_MBUF_PTR(mca);
 			cl_mca = mcl_audit_buf2mca(MC_CL, (mcache_obj_t *)cl);
 
 			/*
@@ -2544,7 +2616,7 @@ mbuf_cslab_audit(void *arg, mcache_obj_t *list, boolean_t alloc)
 		mca = mcl_audit_buf2mca(MC_MBUF, (mcache_obj_t *)m);
 		mcl_audit_mbuf(mca, m, TRUE, alloc);
 		if (mcltrace)
-			mcache_buffer_log(mca, m, m_cache(class));
+			mcache_buffer_log(mca, m, m_cache(class), &mb_start);
 
 		if (alloc)
 			mca->mca_uflags |= MB_COMP_INUSE;
@@ -2557,7 +2629,7 @@ mbuf_cslab_audit(void *arg, mcache_obj_t *list, boolean_t alloc)
 		 * pattern-filled by the above call to mcl_audit_mbuf().
 		 */
 		if (!alloc && mclverify)
-			ms = (struct mbuf *)mca->mca_contents;
+			ms = MCA_SAVED_MBUF_PTR(mca);
 
 		/* Do the cluster sanity checks and record its transaction */
 		cl = ms->m_ext.ext_buf;
@@ -2589,7 +2661,7 @@ mbuf_cslab_audit(void *arg, mcache_obj_t *list, boolean_t alloc)
 			size = m_maxsize(MC_16KCL);
 		mcl_audit_cluster(mca, cl, size, alloc, FALSE);
 		if (mcltrace)
-			mcache_buffer_log(mca, cl, m_cache(class));
+			mcache_buffer_log(mca, cl, m_cache(class), &mb_start);
 
 		if (alloc)
 			mca->mca_uflags |= MB_COMP_INUSE;
@@ -2709,18 +2781,20 @@ m_clalloc(const u_int32_t num, const int wait, const u_int32_t bufsize)
 	for (i = 0; i < numpages; i++, page += NBPG) {
 		ppnum_t offset = ((char *)page - (char *)mbutl) / NBPG;
 		ppnum_t new_page = pmap_find_phys(kernel_pmap, page);
+		mbuf_class_t class = MC_BIGCL;
 
 		/*
-		 * In the case of no mapper being available the following
-		 * code noops and returns the input page; if there is a
-		 * mapper the appropriate I/O page is returned.
+		 * If there is a mapper the appropriate I/O page is returned;
+		 * zero out the page to discard its past contents to prevent
+		 * exposing leftover kernel memory.
 		 */
 		VERIFY(offset < mcl_pages);
-		if (mcl_paddr_base) {
-		    bzero((void *)(uintptr_t) page, page_size);
-		    new_page = IOMapperInsertPage(mcl_paddr_base, offset, new_page);
+		if (mcl_paddr_base != 0) {
+			bzero((void *)(uintptr_t) page, page_size);
+			new_page = IOMapperInsertPage(mcl_paddr_base,
+			    offset, new_page);
 		}
-		mcl_paddr[offset] = new_page << PGSHIFT;
+		mcl_paddr[offset] = new_page;
 
 		/* Pattern-fill this fresh page */
 		if (mclverify) {
@@ -2748,6 +2822,7 @@ m_clalloc(const u_int32_t num, const int wait, const u_int32_t bufsize)
 			    m_infree(MC_MBUF_BIGCL);
 			mbstat.m_bigclusters = ++m_total(MC_BIGCL);
 			VERIFY(m_total(MC_BIGCL) <= m_maxlimit(MC_BIGCL));
+			class = MC_BIGCL;
 		} else if ((i % NSLABSP16KB) == 0) {
 			union m16kcluster *m16kcl = (union m16kcluster *)page;
 			mcl_slab_t *nsp;
@@ -2783,7 +2858,10 @@ m_clalloc(const u_int32_t num, const int wait, const u_int32_t bufsize)
 			m_infree(MC_16KCL)++;
 			m_total(MC_16KCL)++;
 			VERIFY(m_total(MC_16KCL) <= m_maxlimit(MC_16KCL));
+			class = MC_16KCL;
 		}
+		if (!mb_peak_newreport && mbuf_report_usage(class))
+			mb_peak_newreport = TRUE;
 	}
 	VERIFY(mca_list == NULL && con_list == NULL);
 
@@ -2939,6 +3017,8 @@ freelist_populate(mbuf_class_t class, unsigned int num, int wait)
 
 		VERIFY(m_total(MC_BIGCL) >= m_minlimit(MC_BIGCL));
 		VERIFY(m_total(class) <= m_maxlimit(class));
+		if (!mb_peak_newreport && mbuf_report_usage(class))
+			mb_peak_newreport = TRUE;
 
 		i = numobj;
 		if (class == MC_MBUF) {
@@ -2957,8 +3037,7 @@ freelist_populate(mbuf_class_t class, unsigned int num, int wait)
 					struct mbuf *ms;
 					mca = mcl_audit_buf2mca(MC_MBUF,
 					    (mcache_obj_t *)m);
-					ms = ((struct mbuf *)
-					    mca->mca_contents);
+					ms = MCA_SAVED_MBUF_PTR(mca);
 					ms->m_type = MT_FREE;
 				} else {
 					m->m_type = MT_FREE;
@@ -3161,13 +3240,13 @@ m_reclaim(mbuf_class_t class, unsigned int num, boolean_t comp)
 	lck_mtx_unlock(mbuf_mlock);
 
 	if (bmap != 0) {
-		/* drain is performed in pfslowtimo(), to avoid deadlocks */
-		do_reclaim = 1;
+		/* signal the domains to drain */
+		net_drain_domains();
 
 		/* Sigh; we have no other choices but to ask mcache to purge */
 		for (m = 0; m < NELEM(mbuf_table); m++) {
 			if ((bmap & (1 << m)) &&
-			    mcache_purge_cache(m_cache(m))) {
+			    mcache_purge_cache(m_cache(m), TRUE)) {
 				lck_mtx_lock(mbuf_mlock);
 				m_purge_cnt(m)++;
 				mbstat.m_drain++;
@@ -3264,8 +3343,10 @@ m_free(struct mbuf *m)
 	if (m->m_type == MT_FREE)
 		panic("m_free: freeing an already freed mbuf");
 
-	/* Free the aux data and tags if there is any */
 	if (m->m_flags & M_PKTHDR) {
+		/* Check for scratch area overflow */
+		m_redzone_verify(m);
+		/* Free the aux data and tags if there is any */
 		m_tag_delete_chain(m, NULL);
 	}
 
@@ -3580,16 +3661,25 @@ m_m16kget(struct mbuf *m, int wait)
 void
 m_copy_pkthdr(struct mbuf *to, struct mbuf *from)
 {
-	/* We will be taking over the tags of 'to' */
-	if (to->m_flags & M_PKTHDR)
+	VERIFY(from->m_flags & M_PKTHDR);
+
+	/* Check for scratch area overflow */
+	m_redzone_verify(from);
+
+	if (to->m_flags & M_PKTHDR) {
+		/* Check for scratch area overflow */
+		m_redzone_verify(to);
+		/* We will be taking over the tags of 'to' */
 		m_tag_delete_chain(to, NULL);
+	}
 	to->m_pkthdr = from->m_pkthdr;		/* especially tags */
-	m_tag_init(from);			/* purge tags from src */
-	m_service_class_init(from);		/* reset svc class from src */
-	from->m_pkthdr.aux_flags = 0;		/* clear aux flags from src */
+	m_classifier_init(from, 0);		/* purge classifier info */
+	m_tag_init(from, 1);			/* purge all tags from src */
+	m_scratch_init(from);			/* clear src scratch area */
 	to->m_flags = (from->m_flags & M_COPYFLAGS) | (to->m_flags & M_EXT);
 	if ((to->m_flags & M_EXT) == 0)
 		to->m_data = to->m_pktdat;
+	m_redzone_init(to);			/* setup red zone on dst */
 }
 
 /*
@@ -3600,13 +3690,23 @@ m_copy_pkthdr(struct mbuf *to, struct mbuf *from)
 static int
 m_dup_pkthdr(struct mbuf *to, struct mbuf *from, int how)
 {
-	if (to->m_flags & M_PKTHDR)
+	VERIFY(from->m_flags & M_PKTHDR);
+
+	/* Check for scratch area overflow */
+	m_redzone_verify(from);
+
+	if (to->m_flags & M_PKTHDR) {
+		/* Check for scratch area overflow */
+		m_redzone_verify(to);
+		/* We will be taking over the tags of 'to' */
 		m_tag_delete_chain(to, NULL);
+	}
 	to->m_flags = (from->m_flags & M_COPYFLAGS) | (to->m_flags & M_EXT);
 	if ((to->m_flags & M_EXT) == 0)
 		to->m_data = to->m_pktdat;
 	to->m_pkthdr = from->m_pkthdr;
-	m_tag_init(to);
+	m_redzone_init(to);			/* setup red zone on dst */
+	m_tag_init(to, 0);			/* preserve dst static tags */
 	return (m_tag_copy_chain(to, from, how));
 }
 
@@ -3614,8 +3714,46 @@ void
 m_copy_pftag(struct mbuf *to, struct mbuf *from)
 {
 	to->m_pkthdr.pf_mtag = from->m_pkthdr.pf_mtag;
+#if PF_ECN
 	to->m_pkthdr.pf_mtag.pftag_hdr = NULL;
 	to->m_pkthdr.pf_mtag.pftag_flags &= ~(PF_TAG_HDR_INET|PF_TAG_HDR_INET6);
+#endif /* PF_ECN */
+}
+
+void
+m_classifier_init(struct mbuf *m, uint32_t pktf_mask)
+{
+	VERIFY(m->m_flags & M_PKTHDR);
+
+	m->m_pkthdr.pkt_proto = 0;
+	m->m_pkthdr.pkt_flowsrc = 0;
+	m->m_pkthdr.pkt_flowid = 0;
+	m->m_pkthdr.pkt_flags &= pktf_mask;	/* caller-defined mask */
+	/* preserve service class and interface info for loopback packets */
+	if (!(m->m_pkthdr.pkt_flags & PKTF_LOOP))
+		(void) m_set_service_class(m, MBUF_SC_BE);
+	if (!(m->m_pkthdr.pkt_flags & PKTF_IFAINFO))
+		m->m_pkthdr.pkt_ifainfo = 0;
+#if MEASURE_BW
+	m->m_pkthdr.pkt_bwseq  = 0;
+#endif /* MEASURE_BW */
+}
+
+void
+m_copy_classifier(struct mbuf *to, struct mbuf *from)
+{
+	VERIFY(to->m_flags & M_PKTHDR);
+	VERIFY(from->m_flags & M_PKTHDR);
+
+	to->m_pkthdr.pkt_proto = from->m_pkthdr.pkt_proto;
+	to->m_pkthdr.pkt_flowsrc = from->m_pkthdr.pkt_flowsrc;
+	to->m_pkthdr.pkt_flowid = from->m_pkthdr.pkt_flowid;
+	to->m_pkthdr.pkt_flags = from->m_pkthdr.pkt_flags;
+	(void) m_set_service_class(to, from->m_pkthdr.pkt_svc);
+	to->m_pkthdr.pkt_ifainfo  = from->m_pkthdr.pkt_ifainfo;
+#if MEASURE_BW
+	to->m_pkthdr.pkt_bwseq  = from->m_pkthdr.pkt_bwseq;
+#endif /* MEASURE_BW */
 }
 
 /*
@@ -4166,6 +4304,9 @@ m_freem_list(struct mbuf *m)
 				mt_free++;
 
 			if (m->m_flags & M_PKTHDR) {
+				/* Check for scratch area overflow */
+				m_redzone_verify(m);
+				/* Free the aux data and tags if there is any */
 				m_tag_delete_chain(m, NULL);
 			}
 
@@ -4389,7 +4530,7 @@ m_prepend_2(struct mbuf *m, int len, int how)
 int MCFail;
 
 struct mbuf *
-m_copym(struct mbuf *m, int off0, int len, int wait)
+m_copym_mode(struct mbuf *m, int off0, int len, int wait, uint32_t mode)
 {
 	struct mbuf *n, *mhdr = NULL, **np;
 	int off = off0;
@@ -4399,7 +4540,11 @@ m_copym(struct mbuf *m, int off0, int len, int wait)
 	if (off < 0 || len < 0)
 		panic("m_copym: invalid offset %d or len %d", off, len);
 
-	if (off == 0 && (m->m_flags & M_PKTHDR)) {
+	VERIFY((mode != M_COPYM_MUST_COPY_HDR &&
+	    mode != M_COPYM_MUST_MOVE_HDR) || (m->m_flags & M_PKTHDR));
+
+	if ((off == 0 && (m->m_flags & M_PKTHDR)) ||
+	    mode == M_COPYM_MUST_COPY_HDR || mode == M_COPYM_MUST_MOVE_HDR) {
 		mhdr = m;
 		copyhdr = 1;
 	}
@@ -4420,38 +4565,57 @@ m_copym(struct mbuf *m, int off0, int len, int wait)
 			break;
 		}
 
-		n = _M_RETRY(wait, m->m_type);
+		if (copyhdr)
+			n = _M_RETRYHDR(wait, m->m_type);
+		else
+			n = _M_RETRY(wait, m->m_type);
 		*np = n;
 
 		if (n == NULL)
 			goto nospace;
 
 		if (copyhdr != 0) {
-			M_COPY_PKTHDR(n, mhdr);
+			if ((mode == M_COPYM_MOVE_HDR) ||
+			    (mode == M_COPYM_MUST_MOVE_HDR)) {
+				M_COPY_PKTHDR(n, mhdr);
+			} else if ((mode == M_COPYM_COPY_HDR) ||
+			    (mode == M_COPYM_MUST_COPY_HDR)) {
+				if (m_dup_pkthdr(n, mhdr, wait) == 0)
+					goto nospace;
+			}
 			if (len == M_COPYALL)
 				n->m_pkthdr.len -= off0;
 			else
 				n->m_pkthdr.len = len;
 			copyhdr = 0;
-		}
-		if (len == M_COPYALL) {
-			if (MIN(len, (m->m_len - off)) == len) {
-				printf("m->m_len %d - off %d = %d, %d\n",
-				    m->m_len, off, m->m_len - off,
-				    MIN(len, (m->m_len - off)));
+			/*
+			 * There is data to copy from the packet header mbuf
+			 * if it is empty or it is before the starting offset
+			 */
+			if (mhdr != m) {
+				np = &n->m_next;
+				continue;
 			}
 		}
 		n->m_len = MIN(len, (m->m_len - off));
-		if (n->m_len == M_COPYALL) {
-			printf("n->m_len == M_COPYALL, fixing\n");
-			n->m_len = MHLEN;
-		}
 		if (m->m_flags & M_EXT) {
 			n->m_ext = m->m_ext;
 			m_incref(m);
 			n->m_data = m->m_data + off;
 			n->m_flags |= M_EXT;
 		} else {
+			/*
+			 * Limit to the capacity of the destination
+			 */
+			if (n->m_flags & M_PKTHDR)
+				n->m_len = MIN(n->m_len, MHLEN);
+			else
+				n->m_len = MIN(n->m_len, MLEN);
+
+			if (MTOD(n, char *) + n->m_len > ((char *)n) + MSIZE)
+				panic("%s n %p copy overflow", 
+					__func__, n);
+
 			bcopy(MTOD(m, caddr_t)+off, MTOD(n, caddr_t),
 			    (unsigned)n->m_len);
 		}
@@ -4473,6 +4637,13 @@ nospace:
 	return (NULL);
 }
 
+
+struct mbuf *
+m_copym(struct mbuf *m, int off0, int len, int wait)
+{
+	return (m_copym_mode(m, off0, len, wait, M_COPYM_MOVE_HDR));
+}
+
 /*
  * Equivalent to m_copym except that all necessary mbuf hdrs are allocated
  * within this routine also, the last mbuf and offset accessed are passed
@@ -4480,10 +4651,10 @@ nospace:
  * list (normally hung off of the socket)
  */
 struct mbuf *
-m_copym_with_hdrs(struct mbuf *m, int off0, int len0, int wait,
-    struct mbuf **m_lastm, int *m_off)
+m_copym_with_hdrs(struct mbuf *m0, int off0, int len0, int wait,
+    struct mbuf **m_lastm, int *m_off, uint32_t mode)
 {
-	struct mbuf *n, **np = NULL;
+	struct mbuf *m = m0, *n, **np = NULL;
 	int off = off0, len = len0;
 	struct mbuf *top = NULL;
 	int mcflags = MSLEEPF(wait);
@@ -4494,8 +4665,8 @@ m_copym_with_hdrs(struct mbuf *m, int off0, int len0, int wait,
 
 	if (off == 0 && (m->m_flags & M_PKTHDR))
 		copyhdr = 1;
-
-	if (*m_lastm != NULL) {
+	
+	if (m_lastm != NULL && *m_lastm != NULL) {
 		m = *m_lastm;
 		off = *m_off;
 	} else {
@@ -4554,7 +4725,14 @@ m_copym_with_hdrs(struct mbuf *m, int off0, int len0, int wait,
 		}
 
 		if (copyhdr) {
-			M_COPY_PKTHDR(n, m);
+			if ((mode == M_COPYM_MOVE_HDR) ||
+			    (mode == M_COPYM_MUST_MOVE_HDR)) {
+				M_COPY_PKTHDR(n, m);
+			} else if ((mode == M_COPYM_COPY_HDR) ||
+			    (mode == M_COPYM_MUST_COPY_HDR)) {
+				if (m_dup_pkthdr(n, m, wait) == 0)
+					goto nospace;
+			}
 			n->m_pkthdr.len = len;
 			copyhdr = 0;
 		}
@@ -4566,18 +4744,24 @@ m_copym_with_hdrs(struct mbuf *m, int off0, int len0, int wait,
 			n->m_data = m->m_data + off;
 			n->m_flags |= M_EXT;
 		} else {
+			if (MTOD(n, char *) + n->m_len > ((char *)n) + MSIZE)
+				panic("%s n %p copy overflow", 
+					__func__, n);
+
 			bcopy(MTOD(m, caddr_t)+off, MTOD(n, caddr_t),
 			    (unsigned)n->m_len);
 		}
 		len -= n->m_len;
 
 		if (len == 0) {
-			if ((off + n->m_len) == m->m_len) {
-				*m_lastm = m->m_next;
-				*m_off  = 0;
-			} else {
-				*m_lastm = m;
-				*m_off  = off + n->m_len;
+			if (m_lastm != NULL && m_off != NULL) {
+				if ((off + n->m_len) == m->m_len) {
+					*m_lastm = m->m_next;
+					*m_off  = 0;
+				} else {
+					*m_lastm = m;
+					*m_off  = off + n->m_len;
+				}
 			}
 			break;
 		}
@@ -5304,10 +5488,10 @@ extend:
 			 * allocate a new writable mbuf and try again.
 			 */
 
-#if defined(DIAGNOSTIC)
+#if DIAGNOSTIC
 			if (!(flags & M_COPYBACK0_COW))
 				panic("m_copyback0: read-only");
-#endif /* defined(DIAGNOSTIC) */
+#endif /* DIAGNOSTIC */
 
 			/*
 			 * if we're going to write into the middle of
@@ -5417,18 +5601,18 @@ enobufs:
 	return (ENOBUFS);
 }
 
-char *
+uint64_t
 mcl_to_paddr(char *addr)
 {
 	vm_offset_t base_phys;
 
 	if (!MBUF_IN_MAP(addr))
-		return (NULL);
-	base_phys = mcl_paddr[(addr - (char *)mbutl) >> PGSHIFT];
+		return (0);
+	base_phys = mcl_paddr[atop_64(addr - (char *)mbutl)];
 
 	if (base_phys == 0)
-		return (NULL);
-	return ((char *)((uintptr_t)base_phys | ((uintptr_t)addr & PGOFSET)));
+		return (0);
+	return ((uint64_t)(ptoa_64(base_phys) | ((uint64_t)addr & PAGE_MASK)));
 }
 
 /*
@@ -5688,6 +5872,8 @@ m_fixhdr(struct mbuf *m0)
 {
 	u_int len;
 
+	VERIFY(m0->m_flags & M_PKTHDR);
+
 	len = m_length2(m0, NULL);
 	m0->m_pkthdr.len = len;
 	return (len);
@@ -5748,7 +5934,6 @@ m_defrag_offset(struct mbuf *m0, u_int32_t off, int how)
 
 	if (off > 0) {
 		pktlen -= off;
-		m_final->m_len -= off;
 		m_final->m_data += off;
 	}
 
@@ -5757,7 +5942,7 @@ m_defrag_offset(struct mbuf *m0, u_int32_t off, int how)
 	 * pointer before coming here, as otherwise it will point to
 	 * the original mbuf which will get freed upon success.
 	 */
-	VERIFY(m0->m_pkthdr.header == NULL);
+	VERIFY(m0->m_pkthdr.pkt_hdr == NULL);
 
 	if (m_dup_pkthdr(m_final, m0, how) == 0)
 		goto nospace;
@@ -5768,6 +5953,7 @@ m_defrag_offset(struct mbuf *m0, u_int32_t off, int how)
 		length = pktlen - progress;
 		if (length > MCLBYTES)
 			length = MCLBYTES;
+		length -= ((m_new == m_final) ? off : 0);
 
 		if (m_new == NULL) {
 			if (length > MLEN)
@@ -6079,12 +6265,10 @@ slab_get(void *buf)
 
 	if ((slg = slabstbl[ix]) == NULL) {
 		/*
-		 * In the current implementation, we never shrink the memory
-		 * pool (hence the cluster map); if we attempt to reallocate
-		 * a cluster group when it's already allocated, panic since
-		 * this is a sign of a memory corruption (slabstbl[ix] got
-		 * nullified).  This also means that there shouldn't be any
-		 * hole in the kernel sub-map for the mbuf pool.
+		 * In the current implementation, we never shrink the slabs 
+		 * table; if we attempt to reallocate a cluster group when
+		 * it's already allocated, panic since this is a sign of a
+		 * memory corruption (slabstbl[ix] got nullified).
 		 */
 		++slabgrp;
 		VERIFY(ix < slabgrp);
@@ -6269,9 +6453,14 @@ mcl_audit_init(void *buf, mcache_audit_t **mca_list,
 
 		/* Attach the contents buffer if requested */
 		if (save_contents) {
-			VERIFY(con != NULL);
+			mcl_saved_contents_t *msc =
+			    (mcl_saved_contents_t *)(void *)con;
+
+			VERIFY(msc != NULL);
+			VERIFY(IS_P2ALIGNED(msc, sizeof (u_int64_t)));
+			VERIFY(con_size == sizeof (*msc));
 			mca->mca_contents_size = con_size;
-			mca->mca_contents = con;
+			mca->mca_contents = msc;
 			con = con->obj_next;
 			bzero(mca->mca_contents, mca->mca_contents_size);
 		}
@@ -6285,6 +6474,29 @@ mcl_audit_init(void *buf, mcache_audit_t **mca_list,
 
 	*mca_list = mca_tail->mca_next;
 	mca_tail->mca_next = NULL;
+}
+
+static void
+mcl_audit_free(void *buf, unsigned int num)
+{
+	unsigned int i, ix;
+	mcache_audit_t *mca, *mca_list;
+
+	ix = MTOBG(buf);
+	VERIFY(ix < maxclaudit);
+	
+	if (mclaudit[ix].cl_audit[0] != NULL) {
+		mca_list = mclaudit[ix].cl_audit[0];
+		for (i = 0; i < num; i++) {
+			mca = mclaudit[ix].cl_audit[i];
+			mclaudit[ix].cl_audit[i] = NULL;
+			if (mca->mca_contents)
+				mcache_free(mcl_audit_con_cache,
+				    mca->mca_contents);
+		}
+		mcache_free_ext(mcache_audit_cache,
+		    (mcache_obj_t *)mca_list);
+	}
 }
 
 /*
@@ -6372,19 +6584,20 @@ mcl_audit_mbuf(mcache_audit_t *mca, void *addr, boolean_t composite,
 static void
 mcl_audit_restore_mbuf(struct mbuf *m, mcache_audit_t *mca, boolean_t composite)
 {
-	struct mbuf *ms = (struct mbuf *)mca->mca_contents;
+	struct mbuf *ms = MCA_SAVED_MBUF_PTR(mca);
 
 	if (composite) {
 		struct mbuf *next = m->m_next;
 		VERIFY(ms->m_flags == M_EXT && MEXT_RFA(ms) != NULL &&
 		    MBUF_IS_COMPOSITE(ms));
+		VERIFY(mca->mca_contents_size == AUDIT_CONTENTS_SIZE);
 		/*
 		 * We could have hand-picked the mbuf fields and restore
 		 * them individually, but that will be a maintenance
 		 * headache.  Instead, restore everything that was saved;
 		 * the mbuf layer will recheck and reinitialize anyway.
 		 */
-		bcopy(ms, m, mca->mca_contents_size);
+		bcopy(ms, m, MCA_SAVED_MBUF_SIZE);
 		m->m_next = next;
 	} else {
 		/*
@@ -6400,8 +6613,9 @@ mcl_audit_restore_mbuf(struct mbuf *m, mcache_audit_t *mca, boolean_t composite)
 static void
 mcl_audit_save_mbuf(struct mbuf *m, mcache_audit_t *mca)
 {
+	VERIFY(mca->mca_contents_size == AUDIT_CONTENTS_SIZE);
 	_MCHECK(m);
-	bcopy(m, mca->mca_contents, mca->mca_contents_size);
+	bcopy(m, MCA_SAVED_MBUF_PTR(mca), MCA_SAVED_MBUF_SIZE);
 }
 
 static void
@@ -6423,6 +6637,32 @@ mcl_audit_cluster(mcache_audit_t *mca, void *addr, size_t size, boolean_t alloc,
 		mcl_audit_verify_nextptr(next, mca);
 		mcache_audit_free_verify_set(mca, addr, 0, size);
 	}
+}
+
+static void
+mcl_audit_scratch(mcache_audit_t *mca)
+{
+	void *stack[MCACHE_STACK_DEPTH + 1];
+	mcl_scratch_audit_t *msa;
+	struct timeval now;
+
+	VERIFY(mca->mca_contents != NULL);
+	msa = MCA_SAVED_SCRATCH_PTR(mca);
+
+	msa->msa_pthread = msa->msa_thread;
+	msa->msa_thread = current_thread();
+	bcopy(msa->msa_stack, msa->msa_pstack, sizeof (msa->msa_pstack));
+	msa->msa_pdepth = msa->msa_depth;
+	bzero(stack, sizeof (stack));
+	msa->msa_depth = OSBacktrace(stack, MCACHE_STACK_DEPTH + 1) - 1;
+	bcopy(&stack[1], msa->msa_stack, sizeof (msa->msa_stack));
+
+	msa->msa_ptstamp = msa->msa_tstamp;
+	microuptime(&now);
+	/* tstamp is in ms relative to base_ts */
+	msa->msa_tstamp = ((now.tv_usec - mb_start.tv_usec) / 1000);
+	if ((now.tv_sec - mb_start.tv_sec) > 0)
+		msa->msa_tstamp += ((now.tv_sec - mb_start.tv_sec) * 1000);
 }
 
 static void
@@ -6900,11 +7140,13 @@ mbuf_dump(void)
 			if (i < mltr->mltr_depth) {
 				if (mleak_stat->ml_isaddr64) {
 					k = snprintf(c, clen, "0x%0llx  ",
-					    mltr->mltr_addr[i]);
+					    (uint64_t)VM_KERNEL_UNSLIDE(
+						mltr->mltr_addr[i]));
 				} else {
 					k = snprintf(c, clen,
 					    "0x%08x  ",
-					    (u_int32_t)mltr->mltr_addr[i]);
+					    (uint32_t)VM_KERNEL_UNSLIDE(
+						mltr->mltr_addr[i]));
 				}
 			} else {
 				if (mleak_stat->ml_isaddr64)
@@ -6925,18 +7167,409 @@ done:
 
 #undef MBUF_DUMP_BUF_CHK
 
+/*
+ * Convert between a regular and a packet header mbuf.  Caller is responsible
+ * for setting or clearing M_PKTHDR; this routine does the rest of the work.
+ */
+int
+m_reinit(struct mbuf *m, int hdr)
+{
+	int ret = 0;
+
+	if (hdr) {
+		VERIFY(!(m->m_flags & M_PKTHDR));
+		if (!(m->m_flags & M_EXT) &&
+		    (m->m_data != m->m_dat || m->m_len > 0)) {
+			/*
+			 * If there's no external cluster attached and the
+			 * mbuf appears to contain user data, we cannot
+			 * safely convert this to a packet header mbuf,
+			 * as the packet header structure might overlap
+			 * with the data.
+			 */
+			printf("%s: cannot set M_PKTHDR on altered mbuf %llx, "
+			    "m_data %llx (expected %llx), "
+			    "m_len %d (expected 0)\n",
+			    __func__,
+			    (uint64_t)VM_KERNEL_ADDRPERM(m),
+			    (uint64_t)VM_KERNEL_ADDRPERM(m->m_data),
+			    (uint64_t)VM_KERNEL_ADDRPERM(m->m_dat), m->m_len);
+			ret = EBUSY;
+		} else {
+			VERIFY((m->m_flags & M_EXT) || m->m_data == m->m_dat);
+			m->m_flags |= M_PKTHDR;
+			MBUF_INIT_PKTHDR(m);
+		}
+	} else {
+		/* Check for scratch area overflow */
+		m_redzone_verify(m);
+		/* Free the aux data and tags if there is any */
+		m_tag_delete_chain(m, NULL);
+		m->m_flags &= ~M_PKTHDR;
+	}
+
+	return (ret);
+}
+
+void
+m_scratch_init(struct mbuf *m)
+{
+	struct pkthdr *pkt = &m->m_pkthdr;
+
+	VERIFY(m->m_flags & M_PKTHDR);
+
+	/* See comments in <rdar://problem/14040693> */
+	if (pkt->pkt_flags & PKTF_PRIV_GUARDED) {
+		panic_plain("Invalid attempt to modify guarded module-private "
+		    "area: mbuf %p, pkt_flags 0x%x\n", m, pkt->pkt_flags);
+		/* NOTREACHED */
+	}
+
+	bzero(&pkt->pkt_mpriv, sizeof (pkt->pkt_mpriv));
+}
+
+/*
+ * This routine is reserved for mbuf_get_driver_scratch(); clients inside
+ * xnu that intend on utilizing the module-private area should directly
+ * refer to the pkt_mpriv structure in the pkthdr.  They are also expected
+ * to set and clear PKTF_PRIV_GUARDED, while owning the packet and prior
+ * to handing it off to another module, respectively.
+ */
+u_int32_t
+m_scratch_get(struct mbuf *m, u_int8_t **p)
+{
+	struct pkthdr *pkt = &m->m_pkthdr;
+
+	VERIFY(m->m_flags & M_PKTHDR);
+
+	/* See comments in <rdar://problem/14040693> */
+	if (pkt->pkt_flags & PKTF_PRIV_GUARDED) {
+		panic_plain("Invalid attempt to access guarded module-private "
+		    "area: mbuf %p, pkt_flags 0x%x\n", m, pkt->pkt_flags);
+		/* NOTREACHED */
+	}
+
+	if (mcltrace) {
+		mcache_audit_t *mca;
+
+		lck_mtx_lock(mbuf_mlock);
+		mca = mcl_audit_buf2mca(MC_MBUF, (mcache_obj_t *)m);
+		if (mca->mca_uflags & MB_SCVALID)
+			mcl_audit_scratch(mca);
+		lck_mtx_unlock(mbuf_mlock);
+	}
+
+	*p = (u_int8_t *)&pkt->pkt_mpriv;
+	return (sizeof (pkt->pkt_mpriv));
+}
+
+static void
+m_redzone_init(struct mbuf *m)
+{
+	VERIFY(m->m_flags & M_PKTHDR);
+	/*
+	 * Each mbuf has a unique red zone pattern, which is a XOR
+	 * of the red zone cookie and the address of the mbuf.
+	 */
+	m->m_pkthdr.redzone = ((u_int32_t)(uintptr_t)m) ^ mb_redzone_cookie;
+}
+
+static void
+m_redzone_verify(struct mbuf *m)
+{
+	u_int32_t mb_redzone;
+
+	VERIFY(m->m_flags & M_PKTHDR);
+
+	mb_redzone = ((u_int32_t)(uintptr_t)m) ^ mb_redzone_cookie;
+	if (m->m_pkthdr.redzone != mb_redzone) {
+		panic("mbuf %p redzone violation with value 0x%x "
+		    "(instead of 0x%x, using cookie 0x%x)\n",
+		    m, m->m_pkthdr.redzone, mb_redzone, mb_redzone_cookie);
+		/* NOTREACHED */
+	}
+}
+
+/*
+ * Send a report of mbuf usage if the usage is at least 6% of max limit
+ * or if there has been at least 3% increase since the last report.
+ *
+ * The values 6% and 3% are chosen so that we can do simple arithmetic
+ * with shift operations.
+ */ 
+static boolean_t
+mbuf_report_usage(mbuf_class_t cl)
+{
+	/* if a report is already in progress, nothing to do */
+	if (mb_peak_newreport)
+		return (TRUE);
+
+	if (m_total(cl) > m_peak(cl) &&
+	    m_total(cl) >= (m_maxlimit(cl) >> 4) &&
+	    (m_total(cl) - m_peak(cl)) >= (m_peak(cl) >> 5))
+		return (TRUE);
+	return (FALSE);
+}
+
+__private_extern__ void
+mbuf_report_peak_usage(void)
+{
+	int i = 0; 
+	u_int64_t uptime;
+	struct nstat_sysinfo_data ns_data;
+	uint32_t memreleased = 0;
+
+	uptime = net_uptime();
+	lck_mtx_lock(mbuf_mlock);
+
+	/* Generate an initial report after 1 week of uptime */
+	if (!mb_peak_firstreport && 
+	    uptime > MBUF_PEAK_FIRST_REPORT_THRESHOLD) {
+		mb_peak_newreport = TRUE;
+		mb_peak_firstreport = TRUE;
+	}
+
+	if (!mb_peak_newreport) {
+		lck_mtx_unlock(mbuf_mlock);
+		return;
+	}
+
+	/*
+	 * Since a report is being generated before 1 week, 
+	 * we do not need to force another one later
+	 */
+	if (uptime < MBUF_PEAK_FIRST_REPORT_THRESHOLD)
+		mb_peak_firstreport = TRUE;
+
+	for (i = 0; i < NELEM(mbuf_table); i++) {
+		m_peak(m_class(i)) = m_total(m_class(i));
+		memreleased += m_release_cnt(i);
+	}
+	mb_peak_newreport = FALSE;
+	lck_mtx_unlock(mbuf_mlock);
+
+	bzero(&ns_data, sizeof(ns_data));
+	ns_data.flags = NSTAT_SYSINFO_MBUF_STATS;
+	ns_data.u.mb_stats.total_256b = m_peak(MC_MBUF);
+	ns_data.u.mb_stats.total_2kb = m_peak(MC_CL);
+	ns_data.u.mb_stats.total_4kb = m_peak(MC_BIGCL);
+	ns_data.u.mb_stats.sbmb_total = total_sbmb_cnt_peak;
+	ns_data.u.mb_stats.sb_atmbuflimit = sbmb_limreached;
+	ns_data.u.mb_stats.draincnt = mbstat.m_drain;
+	ns_data.u.mb_stats.memreleased = memreleased;
+
+	nstat_sysinfo_send_data(&ns_data);
+}
+
+/*
+ * Called by the VM when there's memory pressure.
+ */
+__private_extern__ void
+m_drain(void)
+{
+	mbuf_class_t mc;
+	mcl_slab_t *sp, *sp_tmp, *nsp;
+	unsigned int num, k, interval, released = 0;
+	unsigned int total_mem = 0, use_mem = 0;
+	boolean_t ret, purge_caches = FALSE;
+	ppnum_t offset;
+	mcache_obj_t *obj;
+	float per;
+	static uint64_t last_drain = 0;
+	static unsigned char scratch[32];
+	static ppnum_t scratch_pa = 0;
+
+	if (mb_drain_maxint == 0 || mb_waiters)
+		return;
+	if (scratch_pa == 0) {
+		bzero(scratch, sizeof(scratch));
+		scratch_pa = pmap_find_phys(kernel_pmap, (addr64_t)scratch);
+		VERIFY(scratch_pa);
+	} else if (mclverify) {
+		/*
+		 * Panic if a driver wrote to our scratch memory.
+		 */
+		for (k = 0; k < sizeof(scratch); k++)
+			if (scratch[k])
+				panic("suspect DMA to freed address");
+	}
+	/*
+	 * Don't free memory too often as that could cause excessive
+	 * waiting times for mbufs.  Purge caches if we were asked to drain
+	 * in the last 5 minutes.
+	 */
+	lck_mtx_lock(mbuf_mlock);
+	if (last_drain == 0) {
+		last_drain = net_uptime();
+		lck_mtx_unlock(mbuf_mlock);
+		return;
+	}
+	interval = net_uptime() - last_drain; 
+	if (interval <= mb_drain_maxint) {
+		lck_mtx_unlock(mbuf_mlock);
+		return;
+	} 
+	if (interval <= mb_drain_maxint * 5)
+		purge_caches = TRUE;
+	last_drain = net_uptime();
+	/*
+	 * Don't free any memory if we're using 60% or more.
+	 */
+	for (mc = 0; mc < NELEM(mbuf_table); mc++) {
+		total_mem += m_total(mc) * m_maxsize(mc);
+		use_mem += m_active(mc) * m_maxsize(mc);
+	}
+	per = (float)use_mem / (float)total_mem;
+	if (per >= 0.6) {
+		lck_mtx_unlock(mbuf_mlock);
+		return;
+	}
+	/*
+	 * Purge all the caches.  This effectively disables
+	 * caching for a few seconds, but the mbuf worker thread will
+	 * re-enable them again.
+	 */
+	if (purge_caches == TRUE)
+		for (mc = 0; mc < NELEM(mbuf_table); mc++) {
+			if (m_total(mc) < m_avgtotal(mc))
+				continue;
+			lck_mtx_unlock(mbuf_mlock);
+			ret = mcache_purge_cache(m_cache(mc), FALSE);
+			lck_mtx_lock(mbuf_mlock);
+			if (ret == TRUE)
+				m_purge_cnt(mc)++;
+		}
+	/*
+	 * Move the objects from the composite class freelist to
+	 * the rudimentary slabs list, but keep at least 10% of the average
+	 * total in the freelist.
+	 */
+	for (mc = 0; mc < NELEM(mbuf_table); mc++) {
+		while (m_cobjlist(mc) && 
+		    m_total(mc) < m_avgtotal(mc) &&
+		    m_infree(mc) > 0.1 * m_avgtotal(mc) + m_minlimit(mc)) {
+			obj = m_cobjlist(mc);
+			m_cobjlist(mc) = obj->obj_next;
+			obj->obj_next = NULL;
+			num = cslab_free(mc, obj, 1);
+			VERIFY(num == 1);
+			m_free_cnt(mc)++;
+			m_infree(mc)--;
+			/* cslab_free() handles m_total */
+		}
+	}
+	/*
+	 * Free the buffers present in the slab list up to 10% of the total
+	 * average per class.
+	 *
+	 * We walk the list backwards in an attempt to reduce fragmentation.
+	 */
+	for (mc = NELEM(mbuf_table) - 1; (int)mc >= 0; mc--) {
+		TAILQ_FOREACH_SAFE(sp, &m_slablist(mc), sl_link, sp_tmp) {
+			/*
+			 * Process only unused slabs occupying memory.
+			 */
+			if (sp->sl_refcnt != 0 || sp->sl_len == 0 ||
+			    sp->sl_base == NULL)
+				continue;
+			if (m_total(mc) < m_avgtotal(mc) ||
+			    m_infree(mc) < 0.1 * m_avgtotal(mc) + m_minlimit(mc))
+				break;
+			slab_remove(sp, mc);
+			switch (mc) {
+			case MC_MBUF:
+				m_infree(mc) -= NMBPBG;
+				m_total(mc) -= NMBPBG;
+				if (mclaudit != NULL)
+					mcl_audit_free(sp->sl_base, NMBPBG);
+				break;
+			case MC_CL:
+				m_infree(mc) -= NCLPBG;
+				m_total(mc) -= NCLPBG;
+				if (mclaudit != NULL)
+					mcl_audit_free(sp->sl_base, NMBPBG);
+				break;
+			case MC_BIGCL:
+				m_infree(mc)--;
+				m_total(mc)--;
+				if (mclaudit != NULL)
+					mcl_audit_free(sp->sl_base, NMBPBG);
+				break;
+			case MC_16KCL:
+				m_infree(mc)--;
+				m_total(mc)--;
+				for (nsp = sp, k = 1; k < NSLABSP16KB; k++) {
+					nsp = nsp->sl_next;
+					VERIFY(nsp->sl_refcnt == 0 && 
+					    nsp->sl_base != NULL &&
+					    nsp->sl_len == 0);
+					slab_init(nsp, 0, 0, NULL, NULL, 0, 0,
+					    0);
+					nsp->sl_flags = 0;
+				}
+				if (mclaudit != NULL)
+					mcl_audit_free(sp->sl_base, 1);
+				break;
+			default:
+				/*
+				 * The composite classes have their own
+				 * freelist (m_cobjlist), so we only
+				 * process rudimentary classes here.
+				 */
+				VERIFY(0);
+			}
+			m_release_cnt(mc) += m_size(mc);
+			released += m_size(mc);
+			offset = ((char *)sp->sl_base - (char *)mbutl) / NBPG;
+			/*
+			 * Make sure the IOMapper points to a valid, but
+			 * bogus, address.  This should prevent further DMA
+			 * accesses to freed memory.
+			 */
+			IOMapperInsertPage(mcl_paddr_base, offset, scratch_pa);
+			mcl_paddr[offset] = 0;
+			kmem_free(mb_map, (vm_offset_t)sp->sl_base, 
+			    sp->sl_len);
+			slab_init(sp, 0, 0, NULL, NULL, 0, 0, 0);
+			sp->sl_flags = 0;
+		}
+	}
+	mbstat.m_drain++;
+	mbstat.m_bigclusters = m_total(MC_BIGCL);
+	mbstat.m_clusters = m_total(MC_CL);
+	mbstat.m_mbufs = m_total(MC_MBUF);
+	mbuf_stat_sync();
+	mbuf_mtypes_sync(TRUE);
+	lck_mtx_unlock(mbuf_mlock);
+}
+
+static int
+m_drain_force_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int val = 0, err;
+	
+	err = sysctl_handle_int(oidp, &val, 0, req);
+	if (err != 0 || req->newptr == USER_ADDR_NULL)
+		return (err);
+	if (val)
+		m_drain();
+
+	return (err);
+}
+
 SYSCTL_DECL(_kern_ipc);
 SYSCTL_PROC(_kern_ipc, KIPC_MBSTAT, mbstat,
-    CTLFLAG_RD | CTLFLAG_LOCKED,
+    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
     0, 0, mbstat_sysctl, "S,mbstat", "");
 SYSCTL_PROC(_kern_ipc, OID_AUTO, mb_stat,
-    CTLFLAG_RD | CTLFLAG_LOCKED,
+    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
     0, 0, mb_stat_sysctl, "S,mb_stat", "");
 SYSCTL_PROC(_kern_ipc, OID_AUTO, mleak_top_trace,
-    CTLFLAG_RD | CTLFLAG_LOCKED,
+    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
     0, 0, mleak_top_trace_sysctl, "S,mb_top_trace", "");
 SYSCTL_PROC(_kern_ipc, OID_AUTO, mleak_table,
-    CTLFLAG_RD | CTLFLAG_LOCKED,
+    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
     0, 0, mleak_table_sysctl, "S,mleak_table", "");
 SYSCTL_INT(_kern_ipc, OID_AUTO, mleak_sample_factor,
     CTLFLAG_RW | CTLFLAG_LOCKED, &mleak_table.mleak_sample_factor, 0, "");
@@ -6944,3 +7577,10 @@ SYSCTL_INT(_kern_ipc, OID_AUTO, mb_normalized,
     CTLFLAG_RD | CTLFLAG_LOCKED, &mb_normalized, 0, "");
 SYSCTL_INT(_kern_ipc, OID_AUTO, mb_watchdog,
     CTLFLAG_RW | CTLFLAG_LOCKED, &mb_watchdog, 0, "");
+SYSCTL_PROC(_kern_ipc, OID_AUTO, mb_drain_force,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, 
+    m_drain_force_sysctl, "I",
+    "Forces the mbuf garbage collection to run");
+SYSCTL_INT(_kern_ipc, OID_AUTO, mb_drain_maxint,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &mb_drain_maxint, 0,
+    "Minimum time interval between garbage collection");

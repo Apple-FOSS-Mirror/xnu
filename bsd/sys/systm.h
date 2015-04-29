@@ -134,12 +134,6 @@ extern int securelevel;		/* system security level */
 extern dev_t rootdev;		/* root device */
 extern struct vnode *rootvp;	/* vnode equivalent to above */
 
-#ifdef XNU_KERNEL_PRIVATE
-#define NO_FUNNEL 0
-#define KERNEL_FUNNEL 1
-extern funnel_t * kernel_flock;
-#endif /* XNU_KERNEL_PRIVATE */
-
 #endif /* KERNEL_PRIVATE */
 
 #define SYSINIT(a,b,c,d,e)
@@ -185,13 +179,13 @@ struct time_value;
 void	get_procrustime(struct time_value *tv);
 void	load_init_program(struct proc *p);
 void __pthread_testcancel(int presyscall);
-void syscall_exit_funnelcheck(void);
 void throttle_info_get_last_io_time(mount_t mp, struct timeval *tv);
 void update_last_io_time(mount_t mp);
 #endif /* BSD_KERNEL_PRIVATE */
 
 #ifdef KERNEL_PRIVATE
 void	timeout(void (*)(void *), void *arg, int ticks);
+void	timeout_with_leeway(void (*)(void *), void *arg, int ticks, int leeway_ticks);
 void	untimeout(void (*)(void *), void *arg);
 int  	bsd_hostname(char *, int, int*);
 #endif /* KERNEL_PRIVATE */
@@ -234,16 +228,25 @@ typedef struct __throttle_info_handle *throttle_info_handle_t;
 int	throttle_info_ref_by_mask(uint64_t throttle_mask, throttle_info_handle_t *throttle_info_handle);
 void	throttle_info_rel_by_mask(throttle_info_handle_t throttle_info_handle);
 void	throttle_info_update_by_mask(void *throttle_info_handle, int flags);
-
-void throttle_legacy_process_incr(void);
-void throttle_legacy_process_decr(void);
-
+void 	throttle_info_disable_throttle(int devno);
 /*
  * 'throttle_info_handle' acquired via 'throttle_info_ref_by_mask'
  * 'policy' should be specified as either IOPOL_UTILITY or IPOL_THROTTLE,
  * all other values will be treated as IOPOL_NORMAL (i.e. no throttling)
  */
 int	throttle_info_io_will_be_throttled(void *throttle_info_handle, int policy);
+
+#ifdef XNU_KERNEL_PRIVATE
+void *exec_spawnattr_getmacpolicyinfo(const void *macextensions, const char *policyname, size_t *lenp);
+#endif
+
+#ifdef BSD_KERNEL_PRIVATE
+
+#define THROTTLE_IO_ENABLE	1
+#define THROTTLE_IO_DISABLE	0
+void sys_override_io_throttle(int flag);
+
+#endif /* BSD_KERNEL_PRIVATE */
 
 __END_DECLS
 

@@ -47,7 +47,6 @@
 /* Prototypes that should be elsewhere: */
 extern dev_t	chrtoblk(dev_t dev);
 extern int	chrtoblk_set(int cdev, int bdev);
-extern int	iskmemdev(dev_t dev);
 
 struct bdevsw	bdevsw[] =
 {
@@ -121,7 +120,6 @@ extern d_ioctl_t	volioctl;
 #endif
 
 extern d_open_t		cttyopen;
-extern d_close_t	cttyclose;
 extern d_read_t		cttyread;
 extern d_write_t	cttywrite;
 extern d_ioctl_t	cttyioctl;
@@ -135,12 +133,12 @@ extern d_ioctl_t	mmioctl;
 
 #include <pty.h>
 #if NPTY > 0
-extern struct tty *pt_tty[];
 extern d_open_t		ptsopen;
 extern d_close_t	ptsclose;
 extern d_read_t		ptsread;
 extern d_write_t	ptswrite;
 extern d_stop_t		ptsstop;
+extern d_select_t	ptsselect;
 extern d_open_t		ptcopen;
 extern d_close_t	ptcclose;
 extern d_read_t		ptcread;
@@ -202,9 +200,9 @@ struct cdevsw	cdevsw[] =
     },
     NO_CDEVICE,								/* 1*/
     {
-	cttyopen,	cttyclose,	cttyread,	cttywrite,	/* 2*/
+	cttyopen,	nullclose,	cttyread,	cttywrite,	/* 2*/
 	cttyioctl,	nullstop,	nullreset,	0,		cttyselect,
-	eno_mmap,	eno_strat,	eno_getc,	eno_putc,	D_TTY | D_TRACKCLOSE
+	eno_mmap,	eno_strat,	eno_getc,	eno_putc,	D_TTY
     },
     {
 	nullopen,	nullclose,	mmread,		mmwrite,	/* 3*/
@@ -213,7 +211,7 @@ struct cdevsw	cdevsw[] =
     },
     {
 	ptsopen,	ptsclose,	ptsread,	ptswrite,	/* 4*/
-	ptyioctl,	ptsstop,	nullreset,	pt_tty,		ttselect,
+	ptyioctl,	ptsstop,	nullreset,	0,		ptsselect,
 	eno_mmap,	eno_strat,	eno_getc,	eno_putc,	D_TTY
     },
     {
@@ -308,7 +306,7 @@ isdisk(dev_t dev, int type)
 		}
 		/* FALL THROUGH */
 	case VBLK:
-		if ((D_TYPEMASK & bdevsw[maj].d_type) == D_DISK) {
+		if (bdevsw[maj].d_type == D_DISK) {
 			return (1);
 		}
 		break;
@@ -370,10 +368,3 @@ chrtoblk_set(int cdev, int bdev)
 	return 0;
 }
 
-/*
- * Returns true if dev is /dev/mem or /dev/kmem.
- */
-int iskmemdev(dev_t dev)
-{
-	return (major(dev) == 3 && minor(dev) < 2);
-}

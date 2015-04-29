@@ -67,6 +67,10 @@
 #ifndef _SECURITY_MAC_INTERNAL_H_
 #define _SECURITY_MAC_INTERNAL_H_
 
+#ifndef PRIVATE
+#warning "MAC policy is not KPI, see Technical Q&A QA1574, this header will be removed in next version"
+#endif
+
 #include <string.h>
 #include <sys/param.h>
 #include <sys/queue.h>
@@ -136,46 +140,11 @@ struct mac_label_element {
 LIST_HEAD(mac_label_element_list_t, mac_label_element);
 
 /*
- * Journal operations
- */
-
-#define	MLJ_TYPE_PORT		1
-#define	MLJ_TYPE_TASK		2
-
-#define	MLJ_PORT_OP_INIT	0x0001
-#define	MLJ_PORT_OP_CREATE_K	0x0002
-#define	MLJ_PORT_OP_CREATE	0x0004
-#define	MLJ_PORT_OP_UPDATE	0x0008
-
-#define	MLJ_TASK_OP_INIT	0x0001
-#define	MLJ_TASK_OP_CREATE_K	0x0002
-
-struct mac_label_journal {
-	struct label *l;
-	int type;
-	int ops;
-
-	int kotype;	/* Kernel Port */
-
-	TAILQ_ENTRY(mac_label_journal) link;
-};
-TAILQ_HEAD(mac_label_journal_list_t, mac_label_journal);
-
-int	mac_label_journal_add	(struct label *, int);
-int	mac_label_journal_remove(struct label *);
-struct mac_label_journal *
-	mac_label_journal_find	(struct label *);
-int	mac_label_journal	(struct label *, int, ...);
-void	mac_label_journal_replay(void);
-
-
-/*
  * MAC Framework global variables.
  */
 
 extern struct mac_label_element_list_t mac_label_element_list;
 extern struct mac_label_element_list_t mac_static_label_element_list;
-extern struct mac_label_journal_list_t mac_label_journal_list;
 
 extern struct mac_policy_list mac_policy_list;
 
@@ -202,13 +171,14 @@ extern unsigned int mac_label_mbufs;
 
 extern unsigned int mac_label_vnodes;
 
-static int mac_proc_check_enforce(proc_t p, int enforce_flag);
+static int mac_proc_check_enforce(proc_t p, int enforce_flags);
 
 static __inline__ int mac_proc_check_enforce(proc_t p, int enforce_flags)
 {
 #if CONFIG_MACF
 	return ((p->p_mac_enforce & enforce_flags) != 0);
 #else
+#pragma unused(p,enforce_flags)
 	return 0;
 #endif
 }
@@ -228,12 +198,16 @@ static __inline__ int mac_context_check_enforce(vfs_context_t ctx, int enforce_f
 
 static __inline__ void mac_context_set_enforce(vfs_context_t ctx, int enforce_flags)
 {
+#if CONFIG_MACF
 	proc_t proc = vfs_context_proc(ctx);
 
 	if (proc == NULL)
 		return;
 
 	mac_proc_set_enforce(proc, enforce_flags);
+#else
+#pragma unused(ctx,enforce_flags)
+#endif
 }
 
 

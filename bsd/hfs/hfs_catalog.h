@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2007 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2013 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -107,7 +107,17 @@ struct cat_attr {
 	    u_int32_t	cau_dircount;	/* count of sub dirs (for posix nlink) */
 	    u_int32_t	cau_firstlink;	/* first hardlink link (files only) */
 	} ca_union3;
-	u_int8_t 	ca_finderinfo[32]; /* Opaque Finder information */
+	union {
+		u_int8_t 	ca_finderinfo[32]; /* Opaque Finder information */
+		struct {
+			FndrFileInfo 					ca_finderfileinfo;
+			struct FndrExtendedFileInfo 	ca_finderextendedfileinfo;
+		};
+		struct {
+			FndrDirInfo 					ca_finderdirinfo;
+			struct FndrExtendedDirInfo 		ca_finderextendeddirinfo;
+		};
+	};
 };
 
 /* Aliases for common fields */
@@ -212,6 +222,50 @@ struct cat_entrylist {
 #define CE_LIST_SIZE(entries)	\
 	sizeof (*ce_list) + (((entries) - 1) * sizeof (struct cat_entry))
 
+struct hfsmount;
+
+/*
+ * Catalog FileID/CNID Acquisition / Lookup 
+ *
+ * Some use-cases require that we find a valid CNID
+ * before we may be ready to enter the item into the namespace.
+ * In order to resolve this, we support a hashtable attached to
+ * the mount that is secured by the catalog lock.  
+ * 
+ * Finding the next valid CNID is easy if the wraparound bit is
+ * not set -- you just pull from the hfsmp next pointer.  
+ * If it is set then you must find a free entry in the catalog
+ * and also query the hashtable to see if the item is free or not.
+ * 
+ * If you want to request a CNID before there is a backing item
+ * in the catalog, you must find one that is valid, then insert
+ * it into the hash table until such time that the item is
+ * inserted into the catalog.  After successful catalog insertion,
+ * you must remove the item from the hashtable.
+ */
+
+typedef struct cat_preflightid {
+	cnid_t fileid;
+	LIST_ENTRY(cat_preflightid) id_hash;
+} cat_preflightid_t;
+
+extern int cat_remove_idhash (cat_preflightid_t *preflight);
+extern int cat_insert_idhash (struct hfsmount *hfsmp, cat_preflightid_t *preflight);
+extern int cat_check_idhash (struct hfsmount *hfsmp, cnid_t test_fileid);
+
+/* initialize the id look up hashtable during mount */
+extern void hfs_idhash_init (struct hfsmount *hfsmp);
+
+/* release the id lookup hashtable during unmount */
+extern void hfs_idhash_destroy (struct hfsmount *hfsmp);
+
+/* Get a new CNID for use */
+extern int cat_acquire_cnid (struct hfsmount *hfsmp, cnid_t *new_cnid);
+
+
+/* default size of ID hash is 64 entries */
+#define HFS_IDHASH_DEFAULT 64
+
 
 /*
  * Catalog Operations Hint
@@ -272,11 +326,11 @@ enum {
  * (please don't go around it)
  */
 
-struct hfsmount;
 
 extern void cat_releasedesc(struct cat_desc *descp);
 
 extern int cat_create (	struct hfsmount *hfsmp,
+			cnid_t new_fileid,
 			struct cat_desc *descp,
 			struct cat_attr *attrp,
 			struct cat_desc *out_descp);
@@ -288,6 +342,7 @@ extern int cat_delete (	struct hfsmount *hfsmp,
 extern int cat_lookup (	struct hfsmount *hfsmp,
 			struct cat_desc *descp,
 			int wantrsrc,
+			int force_casesensitive_lookup,
 			struct cat_desc *outdescp,
 			struct cat_attr *attrp,
 			struct cat_fork *forkp,
@@ -296,6 +351,7 @@ extern int cat_lookup (	struct hfsmount *hfsmp,
 extern int cat_idlookup (struct hfsmount *hfsmp,
 			cnid_t cnid,
 			int allow_system_files,
+			int wantrsrc,
 			struct cat_desc *outdescp,
 			struct cat_attr *attrp,
 			struct cat_fork *forkp);
@@ -307,7 +363,8 @@ extern int cat_findname (struct hfsmount *hfsmp,
 extern int cat_getentriesattr(
 			struct hfsmount *hfsmp,
 			directoryhint_t *dirhint,
-			struct cat_entrylist *ce_list);
+			struct cat_entrylist *ce_list, 
+			int *reachedeof);
 
 extern int cat_rename (	struct hfsmount * hfsmp,
 			struct cat_desc * from_cdp,
@@ -318,8 +375,8 @@ extern int cat_rename (	struct hfsmount * hfsmp,
 extern int cat_update (	struct hfsmount *hfsmp,
 			struct cat_desc *descp,
 			struct cat_attr *attrp,
-			struct cat_fork *dataforkp,
-			struct cat_fork *rsrcforkp);
+			const struct cat_fork *dataforkp,
+			const struct cat_fork *rsrcforkp);
 
 extern int cat_getdirentries(
 			struct hfsmount *hfsmp,
@@ -424,6 +481,11 @@ extern int cat_lookup_siblinglinks( struct hfsmount *hfsmp,
                                cnid_t linkfileid,
                                cnid_t *prevlinkid,
                                cnid_t *nextlinkid);
+
+extern int cat_lookup_lastlink( struct hfsmount *hfsmp,
+                               cnid_t startid,
+                               cnid_t *nextlinkid,
+							   struct cat_desc *cdesc);
 
 extern int cat_lookup_dirlink(struct hfsmount *hfsmp, 
 			     cnid_t dirlink_id, 

@@ -85,21 +85,9 @@
  * [various] The mode_t, off_t, and size_t types shall be defined as
  * described in <sys/types.h>
  */
-#ifndef	_MODE_T
-typedef	__darwin_mode_t	mode_t;
-#define _MODE_T
-#endif
-
-#ifndef _OFF_T
-typedef __darwin_off_t	off_t;
-#define _OFF_T
-#endif
-
-#ifndef _SIZE_T
-#define _SIZE_T
-typedef __darwin_size_t	size_t;
-#endif
-
+#include <sys/_types/_mode_t.h>
+#include <sys/_types/_off_t.h>
+#include <sys/_types/_size_t.h>
 
 /*
  * Protections are chosen from these bits, or-ed together
@@ -227,11 +215,16 @@ int	madvise(void *, size_t, int);
 int	mincore(const void *, size_t, char *);
 int	minherit(void *, size_t, int);
 #endif
+
+#ifdef PRIVATE
+int mremap_encrypted(void *, size_t, __uint32_t, __uint32_t, __uint32_t);
+#endif
+
 __END_DECLS
 
 #else	/* KERNEL */
 #ifdef XNU_KERNEL_PRIVATE
-void pshm_cache_init(void) __attribute__((section("__TEXT, initcode")));	/* for bsd_init() */
+void pshm_cache_init(void);	/* for bsd_init() */
 void pshm_lock_init(void);
 
 /*

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -73,6 +73,7 @@
 #include <sys/fcntl.h>
 #include <sys/malloc.h>		/* XXX must be before <sys/file.h> */
 #include <sys/file_internal.h>
+#include <sys/guarded.h>
 #include <sys/filedesc.h>
 #include <sys/lock.h>
 #include <sys/mbuf.h>
@@ -552,7 +553,12 @@ uipc_send(struct socket *so, int flags, struct mbuf *m, struct sockaddr *nam,
 
 		snd->sb_mbmax -= rcv->sb_mbcnt - unp->unp_conn->unp_mbcnt;
 		unp->unp_conn->unp_mbcnt = rcv->sb_mbcnt;
-		snd->sb_hiwat -= rcv->sb_cc - unp->unp_conn->unp_cc;
+		if ((int32_t)snd->sb_hiwat >= 
+		    (int32_t)(rcv->sb_cc - unp->unp_conn->unp_cc)) {
+			snd->sb_hiwat -= rcv->sb_cc - unp->unp_conn->unp_cc;
+		} else {
+			snd->sb_hiwat = 0;
+		}
 		unp->unp_conn->unp_cc = rcv->sb_cc;
 		if (didreceive) {
 			control = NULL;
@@ -674,18 +680,32 @@ uipc_sockaddr(struct socket *so, struct sockaddr **nam)
 }
 
 struct pr_usrreqs uipc_usrreqs = {
-	uipc_abort, uipc_accept, uipc_attach, uipc_bind, uipc_connect,
-	uipc_connect2, pru_control_notsupp, uipc_detach, uipc_disconnect,
-	uipc_listen, uipc_peeraddr, uipc_rcvd, pru_rcvoob_notsupp,
-	uipc_send, uipc_sense, uipc_shutdown, uipc_sockaddr,
-	sosend, soreceive, pru_sopoll_notsupp
+	.pru_abort =		uipc_abort,
+	.pru_accept =		uipc_accept,
+	.pru_attach =		uipc_attach,
+	.pru_bind =		uipc_bind,
+	.pru_connect =		uipc_connect,
+	.pru_connect2 =		uipc_connect2,
+	.pru_detach =		uipc_detach,
+	.pru_disconnect =	uipc_disconnect,
+	.pru_listen =		uipc_listen,
+	.pru_peeraddr =		uipc_peeraddr,
+	.pru_rcvd =		uipc_rcvd,
+	.pru_send =		uipc_send,
+	.pru_sense =		uipc_sense,
+	.pru_shutdown =		uipc_shutdown,
+	.pru_sockaddr =		uipc_sockaddr,
+	.pru_sosend =		sosend,
+	.pru_soreceive =	soreceive,
 };
 
 int
 uipc_ctloutput(struct socket *so, struct sockopt *sopt)
 {
 	struct unpcb *unp = sotounpcb(so);
-	int error;
+	int error = 0;
+	pid_t peerpid;
+	struct socket *peerso;
 
 	switch (sopt->sopt_dir) {
 	case SOPT_GET:
@@ -702,16 +722,41 @@ uipc_ctloutput(struct socket *so, struct sockopt *sopt)
 			}
 			break;
 		case LOCAL_PEERPID:
-			if (unp->unp_conn != NULL) {
-				if (unp->unp_conn->unp_socket != NULL) {
-					pid_t peerpid = unp->unp_conn->unp_socket->last_pid;
-					error = sooptcopyout(sopt, &peerpid, sizeof (peerpid));
-				} else {
-					panic("peer is connected but has no socket?");
-				}
-			} else {
+		case LOCAL_PEEREPID:
+			if (unp->unp_conn == NULL) {
 				error = ENOTCONN;
+				break;
 			}
+			peerso = unp->unp_conn->unp_socket;
+			if (peerso == NULL)
+				panic("peer is connected but has no socket?");
+			unp_get_locks_in_order(so, peerso);
+			if (sopt->sopt_name == LOCAL_PEEREPID &&
+			    peerso->so_flags & SOF_DELEGATED)
+				peerpid = peerso->e_pid;
+			else
+				peerpid = peerso->last_pid;
+			socket_unlock(peerso, 1);
+			error = sooptcopyout(sopt, &peerpid, sizeof (peerpid));
+			break;
+		case LOCAL_PEERUUID:
+		case LOCAL_PEEREUUID:
+			if (unp->unp_conn == NULL) {
+				error = ENOTCONN;
+				break;
+			}
+			peerso = unp->unp_conn->unp_socket;
+			if (peerso == NULL)
+				panic("peer is connected but has no socket?");
+			unp_get_locks_in_order(so, peerso);
+			if (sopt->sopt_name == LOCAL_PEEREUUID &&
+			    peerso->so_flags & SOF_DELEGATED)
+				error = sooptcopyout(sopt, &peerso->e_uuid,
+				    sizeof (peerso->e_uuid));
+			else
+				error = sooptcopyout(sopt, &peerso->last_uuid,
+				    sizeof (peerso->last_uuid));
+			socket_unlock(peerso, 1);
 			break;
 		default:
 			error = EOPNOTSUPP;
@@ -723,6 +768,7 @@ uipc_ctloutput(struct socket *so, struct sockopt *sopt)
 		error = EOPNOTSUPP;
 		break;
 	}
+
 	return (error);
 }
 
@@ -1630,14 +1676,15 @@ unp_pcblist SYSCTL_HANDLER_ARGS
 	return (error);
 }
 
-SYSCTL_PROC(_net_local_dgram, OID_AUTO, pcblist, CTLFLAG_RD | CTLFLAG_LOCKED,
+SYSCTL_PROC(_net_local_dgram, OID_AUTO, pcblist,
+            CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
             (caddr_t)(long)SOCK_DGRAM, 0, unp_pcblist, "S,xunpcb",
             "List of active local datagram sockets");
-SYSCTL_PROC(_net_local_stream, OID_AUTO, pcblist, CTLFLAG_RD | CTLFLAG_LOCKED,
+SYSCTL_PROC(_net_local_stream, OID_AUTO, pcblist,
+            CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
             (caddr_t)(long)SOCK_STREAM, 0, unp_pcblist, "S,xunpcb",
             "List of active local stream sockets");
 
-#if !CONFIG_EMBEDDED
 
 static int
 unp_pcblist64 SYSCTL_HANDLER_ARGS
@@ -1777,14 +1824,15 @@ unp_pcblist64 SYSCTL_HANDLER_ARGS
 	return (error);
 }
 
-SYSCTL_PROC(_net_local_dgram, OID_AUTO, pcblist64, CTLFLAG_RD | CTLFLAG_LOCKED,
+SYSCTL_PROC(_net_local_dgram, OID_AUTO, pcblist64,
+	    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
 	    (caddr_t)(long)SOCK_DGRAM, 0, unp_pcblist64, "S,xunpcb64",
 	    "List of active local datagram sockets 64 bit");
-SYSCTL_PROC(_net_local_stream, OID_AUTO, pcblist64, CTLFLAG_RD | CTLFLAG_LOCKED,
+SYSCTL_PROC(_net_local_stream, OID_AUTO, pcblist64,
+	    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
 	    (caddr_t)(long)SOCK_STREAM, 0, unp_pcblist64, "S,xunpcb64",
 	    "List of active local stream sockets 64 bit");
 
-#endif /* !CONFIG_EMBEDDED */
 
 static void
 unp_shutdown(struct unpcb *unp)
@@ -1865,11 +1913,9 @@ unp_externalize(struct mbuf *rights)
 		if (fdalloc(p, 0, &f))
 			panic("unp_externalize:fdalloc");
 		fg = rp[i];
-		MALLOC_ZONE(fp, struct fileproc *, sizeof (struct fileproc),
-		    M_FILEPROC, M_WAITOK);
+		fp = fileproc_alloc_init(NULL);
 		if (fp == NULL)
 			panic("unp_externalize: MALLOC_ZONE");
-		bzero(fp, sizeof (struct fileproc));
 		fp->f_iocount = 0;
 		fp->f_fglob = fg;
 		fg_removeuipc(fg);
@@ -1949,9 +1995,14 @@ unp_internalize(struct mbuf *control, proc_t p)
 		if (((error = fdgetf_noref(p, fds[i], &tmpfp)) != 0)) {
 			proc_fdunlock(p);
 			return (error);
-		} else if (!filetype_issendable(tmpfp->f_fglob->fg_type)) {
+		} else if (!filetype_issendable(FILEGLOB_DTYPE(tmpfp->f_fglob))) {
 			proc_fdunlock(p);
 			return (EINVAL);
+		} else if (FP_ISGUARDED(tmpfp, GUARD_SOCKET_IPC)) {
+			error = fp_guard_exception(p,
+				fds[i], tmpfp, kGUARD_EXC_SOCKET_IPC);
+			proc_fdunlock(p);
+			return (error);
 		}
 	}
 	rp = (struct fileglob **)(cm + 1);
@@ -2063,21 +2114,17 @@ unp_gc(void)
 			 * accessible and not already marked so.
 			 * Now check if it is possibly one of OUR sockets.
 			 */
-			if (fg->fg_type != DTYPE_SOCKET ||
+			if (FILEGLOB_DTYPE(fg) != DTYPE_SOCKET ||
 			    (so = (struct socket *)fg->fg_data) == 0) {
 				lck_mtx_unlock(&fg->fg_lock);
 				continue;
 			}
-			if (so->so_proto->pr_domain != &localdomain ||
+			if (so->so_proto->pr_domain != localdomain ||
 			    (so->so_proto->pr_flags&PR_RIGHTS) == 0) {
 				lck_mtx_unlock(&fg->fg_lock);
 				continue;
 			}
 #ifdef notdef
-			/*
-			 * if this code is enabled need to run
-			 * under network funnel
-			 */
 			if (so->so_rcv.sb_flags & SB_LOCK) {
 				/*
 				 * This is problematical; it's not clear
@@ -2184,7 +2231,8 @@ unp_gc(void)
 
 		tfg = *fpp;
 
-		if (tfg->fg_type == DTYPE_SOCKET && tfg->fg_data != NULL) {
+		if (FILEGLOB_DTYPE(tfg) == DTYPE_SOCKET &&
+		    tfg->fg_data != NULL) {
 			so = (struct socket *)(tfg->fg_data);
 
 			socket_lock(so, 0);
@@ -2234,7 +2282,6 @@ unp_listen(struct unpcb *unp, proc_t p)
 	return (0);
 }
 
-/* should run under kernel funnel */
 static void
 unp_scan(struct mbuf *m0, void (*op)(struct fileglob *))
 {
@@ -2263,7 +2310,6 @@ unp_scan(struct mbuf *m0, void (*op)(struct fileglob *))
 	}
 }
 
-/* should run under kernel funnel */
 static void
 unp_mark(struct fileglob *fg)
 {
@@ -2280,7 +2326,6 @@ unp_mark(struct fileglob *fg)
 	unp_defer++;
 }
 
-/* should run under kernel funnel */
 static void
 unp_discard(struct fileglob *fg)
 {

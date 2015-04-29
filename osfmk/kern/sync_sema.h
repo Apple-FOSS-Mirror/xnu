@@ -45,7 +45,6 @@
 #ifdef MACH_KERNEL_PRIVATE
 
 #include <kern/queue.h>
-#include <kern/lock.h>
 #include <kern/wait_queue.h>
 
 typedef struct semaphore {
@@ -61,7 +60,7 @@ typedef struct semaphore {
 #define semaphore_lock(semaphore)   wait_queue_lock(&(semaphore)->wait_queue)
 #define semaphore_unlock(semaphore) wait_queue_unlock(&(semaphore)->wait_queue)
 
-extern void semaphore_init(void) __attribute__((section("__TEXT, initcode")));
+extern void semaphore_init(void);
 
 extern	void		semaphore_reference	(semaphore_t semaphore);
 extern	void		semaphore_dereference	(semaphore_t semaphore);

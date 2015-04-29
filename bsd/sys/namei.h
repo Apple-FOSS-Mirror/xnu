@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2011 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -147,7 +147,6 @@ struct nameidata {
 #define	NOFOLLOW	0x00000000 /* do not follow symbolic links (pseudo) */
 /* public FOLLOW	0x00000040    see vnode.h */
 #define	SHAREDLEAF	0x00000080 /* OK to have shared leaf lock */
-/* public NOTRIGGER	0x10000000    see vnode.h */
 #define	MODMASK		0x100000fc /* mask of operational modifiers */
 /*
  * Namei parameter descriptors.
@@ -175,16 +174,20 @@ struct nameidata {
 #define	AUDITVNPATH2	0x00200000 /* audit the path/vnode info */
 #define	USEDVP		0x00400000 /* start the lookup at ndp.ni_dvp */
 #define	CN_VOLFSPATH	0x00800000 /* user path was a volfs style path */
-#if CONFIG_VFS_FUNNEL
-#define FSNODELOCKHELD	0x01000000
-#endif /* CONFIG_VFS_FUNNEL */
 #define UNIONCREATED	0x02000000 /* union fs creation of vnode */
 #if NAMEDRSRCFORK
 #define CN_WANTSRSRCFORK 0x04000000
 #define CN_ALLOWRSRCFORK 0x08000000
 #endif
-/* public NOTRIGGER		0x10000000    see vnode.h */
+#if CONFIG_SECLUDED_RENAME
+#ifdef BSD_KERNEL_PRIVATE
+#define CN_SECLUDE_RENAME 0x10000000 /*rename iff ￢(hard-linked ∨ opened ∨ mmaped)*/
+#endif
+#endif
 #define CN_NBMOUNTLOOK	0x20000000 /* do not block for cross mount lookups */
+#ifdef BSD_KERNEL_PRIVATE
+#define CN_SKIPNAMECACHE	0x40000000	/* skip cache during lookup(), allow FS to handle all components */
+#endif
 
 /*
  * Initialization of an nameidata structure.
@@ -231,9 +234,6 @@ struct nameidata {
  * This structure describes the elements in the cache of recent
  * names looked up by namei.
  */
-
-#define NCHASHMASK	0x7fffffff
-
 struct	namecache {
 	TAILQ_ENTRY(namecache)	nc_entry;	/* chain of all entries */
 	LIST_ENTRY(namecache)	nc_hash;	/* hash chain */
@@ -244,8 +244,7 @@ struct	namecache {
 	} nc_un;
 	vnode_t			nc_dvp;		/* vnode of parent of name */
 	vnode_t			nc_vp;		/* vnode the name refers to */
-        unsigned int		nc_whiteout:1,	/* name has whiteout applied */
-	                        nc_hashval:31;	/* hashval of stringname */
+        unsigned int		nc_hashval;	/* hashval of stringname */
 	const char		*nc_name;	/* pointer to segment name in string cache */
 };
 
@@ -254,10 +253,10 @@ struct	namecache {
 
 int	namei(struct nameidata *ndp);
 void	nameidone(struct nameidata *);
-void	namei_unlock_fsnode(struct nameidata *ndp);
 int	lookup(struct nameidata *ndp);
 int	relookup(struct vnode *dvp, struct vnode **vpp,
 		struct componentname *cnp);
+int	lookup_traverse_union(vnode_t dvp, vnode_t *new_dvp, vfs_context_t ctx);
 void	lookup_compound_vnop_post_hook(int error, vnode_t dvp, vnode_t vp, struct nameidata *ndp, int did_create);
 
 /*

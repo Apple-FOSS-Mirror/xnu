@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2009 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -34,6 +34,8 @@
 #include <vm/pmap.h>
 #include <sys/kdebug.h>
 #include <kern/ledger.h>
+#include <kern/simple_lock.h>
+#include <i386/bit_routines.h>
 
 /*
  * pmap locking
@@ -47,8 +49,15 @@
 	simple_unlock(&(pmap)->lock);		\
 }
 
-#define PMAP_UPDATE_TLBS(pmap, s, e)					\
-	pmap_flush_tlbs(pmap, s, e)
+#define PMAP_UPDATE_TLBS(pmap, s, e)			\
+	pmap_flush_tlbs(pmap, s, e, 0, NULL)
+
+
+#define	PMAP_DELAY_TLB_FLUSH		0x01
+
+#define PMAP_UPDATE_TLBS_DELAYED(pmap, s, e, c)			\
+	pmap_flush_tlbs(pmap, s, e, PMAP_DELAY_TLB_FLUSH, c)
+
 
 #define	iswired(pte)	((pte) & INTEL_PTE_WIRED)
 
@@ -85,16 +94,13 @@ void		pmap_set_reference(
 boolean_t	phys_page_exists(
 			ppnum_t pn);
 
-void pmap_flush_tlbs(pmap_t, vm_map_offset_t, vm_map_offset_t);
+void
+pmap_flush_tlbs(pmap_t, vm_map_offset_t, vm_map_offset_t, int, pmap_flush_context *);
 
 void
 pmap_update_cache_attributes_locked(ppnum_t, unsigned);
 
-#if CONFIG_YONAH
-extern boolean_t cpu_64bit;
-#else
 extern const boolean_t cpu_64bit;
-#endif
 
 /*
  *	Private data structures.
@@ -232,12 +238,13 @@ typedef struct pv_hashed_entry {
 
 //#define PV_DEBUG 1   /* uncomment to enable some PV debugging code */
 #ifdef PV_DEBUG
-#define CHK_NPVHASH() if(0 == npvhash) panic("npvhash uninitialized");
+#define CHK_NPVHASH() if(0 == npvhashmask) panic("npvhash uninitialized");
 #else
 #define CHK_NPVHASH(x)
 #endif
 
-#define NPVHASH 4095   /* MUST BE 2^N - 1 */
+#define NPVHASHBUCKETS (4096)
+#define NPVHASHMASK ((NPVHASHBUCKETS) - 1) /* MUST BE 2^N - 1 */
 #define PV_HASHED_LOW_WATER_MARK_DEFAULT 5000
 #define PV_HASHED_KERN_LOW_WATER_MARK_DEFAULT 2000
 #define PV_HASHED_ALLOC_CHUNK_INITIAL 2000
@@ -252,13 +259,14 @@ extern uint32_t  pv_hashed_low_water_mark, pv_hashed_kern_low_water_mark;
 
 #define LOCK_PV_HASH(hash)	lock_hash_hash(hash)
 #define UNLOCK_PV_HASH(hash)	unlock_hash_hash(hash)
-extern uint32_t npvhash;
+extern uint32_t npvhashmask;
 extern pv_hashed_entry_t	*pv_hash_table;  /* hash lists */
 extern pv_hashed_entry_t	pv_hashed_free_list;
 extern pv_hashed_entry_t	pv_hashed_kern_free_list;
 decl_simple_lock_data(extern, pv_hashed_free_list_lock)
 decl_simple_lock_data(extern, pv_hashed_kern_free_list_lock)
 decl_simple_lock_data(extern, pv_hash_table_lock)
+decl_simple_lock_data(extern, phys_backup_lock)
 
 extern zone_t		pv_hashed_list_zone;	/* zone of pv_hashed_entry
 						 * structures */
@@ -367,6 +375,10 @@ static inline void pmap_pv_throttle(__unused pmap_t p) {
 #define IS_MANAGED_PAGE(x)				\
 	((unsigned int)(x) <= last_managed_page &&	\
 	 (pmap_phys_attributes[x] & PHYS_MANAGED))
+#define IS_INTERNAL_PAGE(x)			\
+	(IS_MANAGED_PAGE(x) && (pmap_phys_attributes[x] & PHYS_INTERNAL))
+#define IS_REUSABLE_PAGE(x)			\
+	(IS_MANAGED_PAGE(x) && (pmap_phys_attributes[x] & PHYS_REUSABLE))
 
 /*
  *	Physical page attributes.  Copy bits from PTE definition.
@@ -378,6 +390,8 @@ static inline void pmap_pv_throttle(__unused pmap_t p) {
 #define	PHYS_NCACHE	INTEL_PTE_NCACHE
 #define	PHYS_PTA	INTEL_PTE_PTA
 #define	PHYS_CACHEABILITY_MASK (INTEL_PTE_PTA | INTEL_PTE_NCACHE)
+#define PHYS_INTERNAL	INTEL_PTE_WTHRU	/* page from internal object */
+#define PHYS_REUSABLE	INTEL_PTE_WRITE /* page is "reusable" */
 
 extern const boolean_t	pmap_disable_kheap_nx;
 extern const boolean_t	pmap_disable_kstack_nx;
@@ -467,9 +481,10 @@ extern unsigned int    inuse_ptepages_count;
 static inline uint32_t
 pvhashidx(pmap_t pmap, vm_map_offset_t va)
 {
-	return ((uint32_t)(uintptr_t)pmap ^
+	uint32_t hashidx = ((uint32_t)(uintptr_t)pmap ^
 		((uint32_t)(va >> PAGE_SHIFT) & 0xFFFFFFFF)) &
-	       npvhash;
+	       npvhashmask;
+	    return hashidx;
 }
 
 
@@ -750,7 +765,7 @@ pmap_pv_remove_retry:
 		if (pac == PMAP_ACTION_IGNORE)
 			goto pmap_pv_remove_exit;
 		else if (pac == PMAP_ACTION_ASSERT)
-			panic("pmap_pv_remove(%p,0x%llx,0x%x, 0x%llx, %p, %p): null pv_list!", pmap, vaddr, ppn, *pte, ppnp, pte);
+			panic("Possible memory corruption: pmap_pv_remove(%p,0x%llx,0x%x, 0x%llx, %p, %p): null pv_list!", pmap, vaddr, ppn, *pte, ppnp, pte);
 		else if (pac == PMAP_ACTION_RETRY_RELOCK) {
 			LOCK_PVH(ppn_to_pai(*ppnp));
 			pmap_phys_attributes[ppn_to_pai(*ppnp)] |= (PHYS_MODIFIED | PHYS_REFERENCED);
@@ -780,7 +795,7 @@ pmap_pv_remove_retry:
 			remque(&pvh_e->qlink);
 			pprevh = pvhash(pvhash_idx);
 			if (PV_HASHED_ENTRY_NULL == *pprevh) {
-				panic("pmap_pv_remove(%p,0x%llx,0x%x): "
+				panic("Possible memory corruption: pmap_pv_remove(%p,0x%llx,0x%x): "
 				      "empty hash, removing rooted",
 				      pmap, vaddr, ppn);
 			}
@@ -803,7 +818,7 @@ pmap_pv_remove_retry:
 		LOCK_PV_HASH(pvhash_idx);
 		pprevh = pvhash(pvhash_idx);
 		if (PV_HASHED_ENTRY_NULL == *pprevh) {
-			panic("pmap_pv_remove(%p,0x%llx,0x%x, 0x%llx, %p): empty hash",
+			panic("Possible memory corruption: pmap_pv_remove(%p,0x%llx,0x%x, 0x%llx, %p): empty hash",
 			    pmap, vaddr, ppn, *pte, pte);
 		}
 		pvh_e = *pprevh;
@@ -823,7 +838,7 @@ pmap_pv_remove_retry:
 			pmap_pagetable_corruption_action_t pac = pmap_classify_pagetable_corruption(pmap, vaddr, ppnp, pte, ROOT_PRESENT);
 
 			if (pac == PMAP_ACTION_ASSERT)
-				panic("pmap_pv_remove(%p, 0x%llx, 0x%x, 0x%llx, %p, %p): pv not on hash, head: %p, 0x%llx", pmap, vaddr, ppn, *pte, ppnp, pte, pv_h->pmap, pv_h->va);
+				panic("Possible memory corruption: pmap_pv_remove(%p, 0x%llx, 0x%x, 0x%llx, %p, %p): pv not on hash, head: %p, 0x%llx", pmap, vaddr, ppn, *pte, ppnp, pte, pv_h->pmap, pv_h->va);
 			else {
 				UNLOCK_PV_HASH(pvhash_idx);
 				if (pac == PMAP_ACTION_RETRY_RELOCK) {
@@ -906,7 +921,9 @@ int		phys_attribute_test(
 			int		bits);
 void		phys_attribute_clear(
 			ppnum_t		phys,
-			int		bits);
+			int		bits,
+			unsigned int	options,
+	                void		*arg);
 
 //#define PCID_DEBUG 1
 #if	PCID_DEBUG
@@ -929,26 +946,6 @@ pmap_cmpx_pte(pt_entry_t *entryp, pt_entry_t old, pt_entry_t new)
 {
 	boolean_t		ret;
 
-#ifdef __i386__
-	/*
-	 * Load the old value into %edx:%eax
-	 * Load the new value into %ecx:%ebx
-	 * Compare-exchange-8bytes at address entryp (loaded in %edi)
-	 * If the compare succeeds, the new value is stored, return TRUE.
-	 * Otherwise, no swap is made, return FALSE.
-	 */
-	asm volatile(
-		"	lock; cmpxchg8b (%1)	\n\t"
-		"	setz	%%al		\n\t"
-		"	movzbl	%%al,%0"
-		: "=a" (ret)
-		: "D" (entryp),
-		  "a" ((uint32_t)old),
-		  "d" ((uint32_t)(old >> 32)),
-		  "b" ((uint32_t)new),
-		  "c" ((uint32_t)(new >> 32))
-		: "memory");
-#else
 	/*
 	 * Load the old value into %rax
 	 * Load the new value into another register
@@ -965,7 +962,6 @@ pmap_cmpx_pte(pt_entry_t *entryp, pt_entry_t old, pt_entry_t new)
 		  "r" (new),
 		  "r" (entryp)
 		: "memory");
-#endif
 	return ret;
 }
 

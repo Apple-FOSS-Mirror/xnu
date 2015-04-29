@@ -2,6 +2,8 @@
 #include "tests.h"
 #include <mach/mach.h>
 
+extern int g_testbots_active;
+
 /*
  * create_random_name - creates a file with a random / unique name in the given directory.
  * when do_open is true we create a file else we generaate a name that does not exist in the
@@ -177,6 +179,7 @@ int do_execve_test(char * path, char * argv[], void * envp, int killwait)
 	printf("CWD= %s\n", getwd(NULL));
 	fflush(stdout);
 #endif
+
 	/* vfork then execve sleep system command (which we will kill from the parent process) */
 	my_pid = vfork();
 	if (my_pid == -1) {
@@ -329,6 +332,9 @@ int get_architecture()
 		rval = INTEL;
 		break;
 	case CPU_TYPE_ARM:
+#ifdef CPU_TYPE_ARM64
+	case CPU_TYPE_ARM64:
+#endif
 		rval = ARM;
 		break;
 	}
@@ -358,18 +364,23 @@ int get_bits()
 			 */
 
 	/* Check for PPC 64 */
-	if ((my_err = sysctlbyname("hw.optional.64bitops", NULL, &len, NULL, 0)))	goto x86_64check; /* Request size */
-	if (len > sizeof(buf))								goto x86_64check;
-	if ((my_err = sysctlbyname("hw.optional.64bitops", &buf, &len, NULL, 0)))	goto x86_64check; /* Copy value out from kernel */
+	if ((my_err = sysctlbyname("hw.optional.64bitops", NULL, &len, NULL, 0)))	goto check64bit; /* Request size */
+	if (len > sizeof(buf))								goto check64bit;
+	if ((my_err = sysctlbyname("hw.optional.64bitops", &buf, &len, NULL, 0)))	goto check64bit; /* Copy value out from kernel */
 	if (buf == 1) rval = 64;
 	goto finished;
 
-x86_64check:
+check64bit:
+#if defined(__i386__) || defined(__x86_64__)
 	/* Check for x86_64 */
 	if ((my_err = sysctlbyname("hw.optional.x86_64", NULL, &len, NULL, 0)))	goto finished; /* Request size */
 	if (len > sizeof(buf))							goto finished;
 	if ((my_err = sysctlbyname("hw.optional.x86_64", &buf, &len, NULL, 0)))	goto finished; /* Copy value out from kernel */
 	if (buf == 1) rval = 64;
+
+#else 
+#error Unknown architecture.
+#endif
 
 finished:
 	return rval;
@@ -392,6 +403,14 @@ my_printf(const char * __restrict fmt, ...)
 	time_t result;
 	int rv;
 	va_list ap;
+
+	/* if we are running under a TestBot, do a normal printf */
+	if (g_testbots_active) {
+		va_start(ap, fmt);
+		rv = vprintf(fmt, ap);
+		va_end(ap);
+		return rv;
+	}
 
 	/* Get the timestamp for this printf */
 	result = time(NULL);

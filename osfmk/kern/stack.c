@@ -75,10 +75,10 @@ static unsigned int		stack_new_count;						/* total new stack allocations */
 
 static vm_offset_t		stack_addr_mask;
 
-unsigned int			kernel_stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
-vm_offset_t			kernel_stack_size = KERNEL_STACK_SIZE;
-vm_offset_t			kernel_stack_mask = -KERNEL_STACK_SIZE;
-vm_offset_t			kernel_stack_depth_max = 0;
+unsigned int			kernel_stack_pages;
+vm_offset_t			kernel_stack_size;
+vm_offset_t			kernel_stack_mask;
+vm_offset_t			kernel_stack_depth_max;
 
 static inline void
 STACK_ZINFO_PALLOC(thread_t thread)
@@ -158,6 +158,11 @@ stack_init(void)
 {
 	simple_lock_init(&stack_lock_data, 0);
 	
+	kernel_stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE;
+	kernel_stack_size = KERNEL_STACK_SIZE;
+	kernel_stack_mask = -KERNEL_STACK_SIZE;
+	kernel_stack_depth_max = 0;
+
 	if (PE_parse_boot_argn("kernel_stack_pages",
 			       &kernel_stack_pages,
 			       sizeof (kernel_stack_pages))) {
@@ -386,7 +391,9 @@ stack_collect(void)
 			 * back in stack_alloc().
 			 */
 
-			stack = (vm_offset_t)vm_map_trunc_page(stack);
+			stack = (vm_offset_t)vm_map_trunc_page(
+				stack,
+				VM_MAP_PAGE_MASK(kernel_map));
 			stack -= PAGE_SIZE;
 			if (vm_map_remove(
 				    kernel_map,
@@ -551,9 +558,9 @@ processor_set_stack_usage(
 
 	/* OK, have memory and list is locked */
 	thread_list = (thread_t *) addr;
-	for (i = 0, thread = (thread_t) queue_first(&threads);
+	for (i = 0, thread = (thread_t)(void *) queue_first(&threads);
 					!queue_end(&threads, (queue_entry_t) thread);
-					thread = (thread_t) queue_next(&thread->threads)) {
+					thread = (thread_t)(void *) queue_next(&thread->threads)) {
 		thread_reference_internal(thread);
 		thread_list[i++] = thread;
 	}

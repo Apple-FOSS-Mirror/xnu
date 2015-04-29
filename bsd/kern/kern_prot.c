@@ -104,9 +104,6 @@
 
 #if CONFIG_MACF
 #include <security/mac_framework.h>
-#if CONFIG_MACF_MACH
-#include <secuity/mac_mach_internal.h>
-#endif
 #endif
 
 #include <sys/mount_internal.h>
@@ -138,6 +135,9 @@ extern void kauth_cred_print(kauth_cred_t cred);
 #define	DEBUG_CRED_CHANGE(fmt, ...)	do {} while (0)
 #endif	/* !DEBUG_CRED */
 
+#if DEVELOPMENT || DEBUG
+extern void task_importance_update_owner_info(task_t);
+#endif
 
 
 /*
@@ -1842,47 +1842,6 @@ suser(kauth_cred_t cred, u_short *acflag)
 
 
 /*
- * XXX This interface is going away; use kauth_cred_issuser() directly
- * XXX instead.
- */
-int
-is_suser(void)
-{
-	proc_t p = current_proc();
-
-	if (!p)
-		return (0);
-
-	return (proc_suser(p) == 0);
-}
-
-
-/*
- * XXX This interface is going away; use kauth_cred_issuser() directly
- * XXX instead.
- */
-int
-is_suser1(void)
-{
-	proc_t p = current_proc();
-	kauth_cred_t my_cred;
-	posix_cred_t my_pcred;
-	int err;
-
-	if (!p)
-		return (0);
-
-	my_cred = kauth_cred_proc_ref(p);
-	my_pcred = posix_cred_get(my_cred);
-
-	err =  (suser(my_cred, &p->p_acflag) == 0 ||
-			my_pcred->cr_ruid == 0 || my_pcred->cr_svuid == 0);
-	kauth_cred_unref(&my_cred);
-	return(err);
-}
-
-
-/*
  * getlogin
  *
  * Description:	Get login name, if available.
@@ -2038,16 +1997,19 @@ set_security_token(proc_t p)
 	audit_token.val[6] = my_cred->cr_audit.as_aia_p->ai_asid;
 	audit_token.val[7] = p->p_idversion;
 
-#if CONFIG_MACF_MACH
-	mac_task_label_update_cred(my_cred, p->task);
-#endif
-	
 	host_priv = (sec_token.val[0]) ? HOST_PRIV_NULL : host_priv_self();
 #if CONFIG_MACF
 	if (host_priv != HOST_PRIV_NULL && mac_system_check_host_priv(my_cred))
 		host_priv = HOST_PRIV_NULL;
 #endif
 	kauth_cred_unref(&my_cred);
+
+#if DEVELOPMENT || DEBUG
+	/* 
+	 * Update the pid an proc name for importance base if any
+	 */
+	task_importance_update_owner_info(p->task);
+#endif
 
 	return (host_security_set_task_token(host_security_self(),
 					   p->task,
@@ -2112,7 +2074,7 @@ setlcid(proc_t p0, struct setlcid_args *uap, __unused int32_t *retval)
 	case LCID_REMOVE:
 
 		/* Only root may Leave/Orphan. */
-		if (!is_suser1()) {
+		if (!kauth_cred_issuser(kauth_cred_get())) {
 			error = EPERM;
 			goto out;
 		}
@@ -2156,7 +2118,7 @@ setlcid(proc_t p0, struct setlcid_args *uap, __unused int32_t *retval)
 	default:
 
 		/* Only root may Join/Adopt. */
-		if (!is_suser1()) {
+		if (!kauth_cred_issuser(kauth_cred_get())) {
 			error = EPERM;
 			goto out;
 		}

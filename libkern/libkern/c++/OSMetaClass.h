@@ -59,22 +59,14 @@ class OSOrderedSet;
 
 #ifdef XNU_KERNEL_PRIVATE
 
-#ifdef CONFIG_EMBEDDED
-#define APPLE_KEXT_VTABLE_PADDING   0
-#else /* CONFIG_EMBEDDED */
 /*! @parseOnly */
 #define APPLE_KEXT_VTABLE_PADDING   1
-#endif /* CONFIG_EMBEDDED */
 
 #else /* XNU_KERNEL_PRIVATE */
 #include <TargetConditionals.h>
 
-#if TARGET_OS_EMBEDDED
-#define APPLE_KEXT_VTABLE_PADDING   0
-#else /* TARGET_OS_EMBEDDED */
 /*! @parseOnly */
 #define APPLE_KEXT_VTABLE_PADDING   1
-#endif /* TARGET_OS_EMBEDDED */
 
 #endif /* XNU_KERNEL_PRIVATE */
 

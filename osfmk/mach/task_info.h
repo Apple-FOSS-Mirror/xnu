@@ -188,7 +188,7 @@ typedef struct task_thread_times_info	*task_thread_times_info_t;
 #define TASK_ABSOLUTETIME_INFO	1
 
 struct task_absolutetime_info {
-	uint64_t		total_user;		/* total time */
+	uint64_t		total_user;
 	uint64_t		total_system;
 	uint64_t		threads_user;	/* existing threads only */
 	uint64_t		threads_system;
@@ -261,9 +261,8 @@ typedef struct task_extmod_info	*task_extmod_info_t;
 #define TASK_EXTMOD_INFO_COUNT	\
     		(sizeof(task_extmod_info_data_t) / sizeof(natural_t))
 
-/* Always 64-bit in user and kernel */
-#define MACH_TASK_BASIC_INFO     20         /* always 64-bit basic info */
 
+#define MACH_TASK_BASIC_INFO     20         /* always 64-bit basic info */
 struct mach_task_basic_info {
         mach_vm_size_t  virtual_size;       /* virtual memory size (bytes) */
         mach_vm_size_t  resident_size;      /* resident memory size (bytes) */
@@ -279,6 +278,100 @@ typedef struct mach_task_basic_info       mach_task_basic_info_data_t;
 typedef struct mach_task_basic_info       *mach_task_basic_info_t;
 #define MACH_TASK_BASIC_INFO_COUNT   \
                 (sizeof(mach_task_basic_info_data_t) / sizeof(natural_t))
+
+
+#define TASK_POWER_INFO	21
+
+struct task_power_info {
+	uint64_t		total_user;
+	uint64_t		total_system;
+	uint64_t		task_interrupt_wakeups;
+	uint64_t		task_platform_idle_wakeups;
+	uint64_t		task_timer_wakeups_bin_1;
+	uint64_t		task_timer_wakeups_bin_2;
+};
+
+typedef struct task_power_info	task_power_info_data_t;
+typedef struct task_power_info	*task_power_info_t;
+#define TASK_POWER_INFO_COUNT	((mach_msg_type_number_t) \
+		(sizeof (task_power_info_data_t) / sizeof (natural_t)))
+
+
+
+#define TASK_VM_INFO		22
+#define TASK_VM_INFO_PURGEABLE	23
+struct task_vm_info {
+        mach_vm_size_t  virtual_size;	    /* virtual memory size (bytes) */
+	integer_t	region_count;	    /* number of memory regions */
+	integer_t	page_size;
+        mach_vm_size_t  resident_size;	    /* resident memory size (bytes) */
+        mach_vm_size_t  resident_size_peak; /* peak resident size (bytes) */
+
+	mach_vm_size_t	device;
+	mach_vm_size_t	device_peak;
+	mach_vm_size_t	internal;
+	mach_vm_size_t	internal_peak;
+	mach_vm_size_t	external;
+	mach_vm_size_t	external_peak;
+	mach_vm_size_t	reusable;
+	mach_vm_size_t	reusable_peak;
+	mach_vm_size_t	purgeable_volatile_pmap;
+	mach_vm_size_t	purgeable_volatile_resident;
+	mach_vm_size_t	purgeable_volatile_virtual;
+	mach_vm_size_t	compressed;
+	mach_vm_size_t	compressed_peak;
+	mach_vm_size_t	compressed_lifetime;
+};
+typedef struct task_vm_info	task_vm_info_data_t;
+typedef struct task_vm_info	*task_vm_info_t;
+#define TASK_VM_INFO_COUNT	((mach_msg_type_number_t) \
+		(sizeof (task_vm_info_data_t) / sizeof (natural_t)))
+
+
+typedef struct vm_purgeable_info	task_purgable_info_t;
+
+
+#define TASK_TRACE_MEMORY_INFO  24
+struct task_trace_memory_info {
+	uint64_t  user_memory_address; 	/* address of start of trace memory buffer */
+	uint64_t  buffer_size;			/* size of buffer in bytes */
+	uint64_t  mailbox_array_size;	/* size of mailbox area in bytes */
+};
+typedef struct task_trace_memory_info task_trace_memory_info_data_t;
+typedef struct task_trace_memory_info * task_trace_memory_info_t;
+#define TASK_TRACE_MEMORY_INFO_COUNT  ((mach_msg_type_number_t) \
+		(sizeof(task_trace_memory_info_data_t) / sizeof(natural_t)))
+
+#define TASK_WAIT_STATE_INFO  25    /* deprecated. */
+struct task_wait_state_info {
+	uint64_t  total_wait_state_time;	/* Time that all threads past and present have been in a wait state */
+	uint64_t  total_wait_sfi_state_time;	/* Time that threads have been in SFI wait (should be a subset of total wait state time */
+	uint32_t  _reserved[4];
+};
+typedef struct task_wait_state_info task_wait_state_info_data_t;
+typedef struct task_wait_state_info * task_wait_state_info_t;
+#define TASK_WAIT_STATE_INFO_COUNT  ((mach_msg_type_number_t) \
+		(sizeof(task_wait_state_info_data_t) / sizeof(natural_t)))
+
+#define TASK_POWER_INFO_V2	26
+
+typedef struct {
+	uint64_t		task_gpu_utilisation;
+	uint64_t		task_gpu_stat_reserved0;
+	uint64_t		task_gpu_stat_reserved1;
+	uint64_t		task_gpu_stat_reserved2;
+} gpu_energy_data;
+
+typedef gpu_energy_data *gpu_energy_data_t;
+struct task_power_info_v2 {
+	task_power_info_data_t	cpu_energy;
+	gpu_energy_data gpu_energy;
+};
+
+typedef struct task_power_info_v2	task_power_info_v2_data_t;
+typedef struct task_power_info_v2	*task_power_info_v2_t;
+#define TASK_POWER_INFO_V2_COUNT	((mach_msg_type_number_t) \
+		(sizeof (task_power_info_v2_data_t) / sizeof (natural_t)))
 
 /*
  * Obsolete interfaces.

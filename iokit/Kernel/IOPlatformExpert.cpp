@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998-2010 Apple Inc. All rights reserved.
+ * Copyright (c) 1998-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -62,11 +62,11 @@ static void getCStringForObject(OSObject *inObj, char *outStr, size_t outStrLen)
 OSDefineMetaClassAndStructors(IOPlatformExpert, IOService)
 
 OSMetaClassDefineReservedUsed(IOPlatformExpert,  0);
-
 OSMetaClassDefineReservedUsed(IOPlatformExpert,  1);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  2);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  3);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  4);
+OSMetaClassDefineReservedUsed(IOPlatformExpert,  2);
+OSMetaClassDefineReservedUsed(IOPlatformExpert,  3);
+OSMetaClassDefineReservedUsed(IOPlatformExpert,  4);
+
 OSMetaClassDefineReservedUnused(IOPlatformExpert,  5);
 OSMetaClassDefineReservedUnused(IOPlatformExpert,  6);
 OSMetaClassDefineReservedUnused(IOPlatformExpert,  7);
@@ -324,6 +324,17 @@ IOReturn IOPlatformExpert::registerInterruptController(OSSymbol *name, IOInterru
   return kIOReturnSuccess;
 }
 
+IOReturn IOPlatformExpert::deregisterInterruptController(OSSymbol *name)
+{
+  IOLockLock(gIOInterruptControllersLock);
+  
+  gIOInterruptControllers->removeObject(name);
+  
+  IOLockUnlock(gIOInterruptControllersLock);
+  
+  return kIOReturnSuccess;
+}
+
 IOInterruptController *IOPlatformExpert::lookUpInterruptController(OSSymbol *name)
 {
   OSObject              *object;
@@ -363,6 +374,17 @@ bool IOPlatformExpert::platformAdjustService(IOService */*service*/)
   return true;
 }
 
+void IOPlatformExpert::getUTCTimeOfDay(clock_sec_t * secs, clock_nsec_t * nsecs)
+{
+  *secs = getGMTTimeOfDay();
+  *nsecs = 0;
+}
+
+void IOPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, __unused clock_nsec_t nsecs)
+{
+  setGMTTimeOfDay(secs);
+}
+
 
 //*********************************************************************************
 // PMLog
@@ -373,48 +395,14 @@ void IOPlatformExpert::
 PMLog(const char *who, unsigned long event,
       unsigned long param1, unsigned long param2)
 {
-    UInt32 debugFlags = gIOKitDebug;
-    UInt32 traceFlags = gIOKitTrace;
-    uintptr_t   name = 0;
-    UInt32 i = 0;
-
-    if (debugFlags & kIOLogPower) {
-
 	clock_sec_t nows;
 	clock_usec_t nowus;
 	clock_get_system_microtime(&nows, &nowus);
 	nowus += (nows % 1000) * 1000000;
 
-        kprintf("pm%u %p %.30s %d %lx %lx\n",
-		nowus, current_thread(), who,	// Identity
-		(int) event, (long) param1, (long) param2);			// Args
-
-	if (traceFlags & kIOTracePowerMgmt) {
-	    static const UInt32 sStartStopBitField[] = 
-		{ 0x00000000, 0x00000040 }; // Only Program Hardware so far
-
-	    // Arcane formula from Hacker's Delight by Warren
-	    // abs(x)  = ((int) x >> 31) ^ (x + ((int) x >> 31))
-	    UInt32 sgnevent = ((long) event >> 31);
-	    UInt32 absevent = sgnevent ^ (event + sgnevent);
-	    UInt32 code = IODBG_POWER(absevent);
-
-	    UInt32 bit = 1 << (absevent & 0x1f);
-	    if (absevent < sizeof(sStartStopBitField) * 8
-	    && (sStartStopBitField[absevent >> 5] & bit) ) {
-		// Or in the START or END bits, Start = 1 & END = 2
-		//      If sgnevent ==  0 then START -  0 => START
-		// else if sgnevent == -1 then START - -1 => END
-		code |= DBG_FUNC_START - sgnevent;
-	    }
-
-        // Get first 8 characters of the name
-        while ( i < sizeof(uintptr_t) && who[i] != 0) 
-        {    ((char *)&name)[sizeof(uintptr_t)-i-1]=who[i]; i++; }
-	    // Record the timestamp. 
-	    IOTimeStampConstant(code, name, event, param1, param2);
-	}
-    }
+    kprintf("pm%u %p %.30s %d %lx %lx\n",
+		nowus, OBFUSCATE(current_thread()), who,	// Identity
+		(int) event, (long)OBFUSCATE(param1), (long)OBFUSCATE(param2));			// Args
 }
 
 
@@ -749,16 +737,10 @@ static void IOShutdownNotificationsTimedOut(
     thread_call_param_t p0, 
     thread_call_param_t p1)
 {
-#ifdef CONFIG_EMBEDDED
-    /* 30 seconds has elapsed - panic */
-    panic("Halt/Restart Timed Out");
-
-#else /* ! CONFIG_EMBEDDED */
     int type = (int)(long)p0;
 
     /* 30 seconds has elapsed - resume shutdown */
     if(gIOPlatform) gIOPlatform->haltRestart(type);
-#endif /* CONFIG_EMBEDDED */
 }
 
 
@@ -797,6 +779,9 @@ int PEHaltRestart(unsigned int type)
   IOPMrootDomain    *pmRootDomain;
   AbsoluteTime      deadline;
   thread_call_t     shutdown_hang;
+  IORegistryEntry   *node;
+  OSData            *data;
+  uint32_t          timeout = 30;
   
   if(type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU)
   {
@@ -808,11 +793,20 @@ int PEHaltRestart(unsigned int type)
     
     /* Spawn a thread that will panic in 30 seconds. 
        If all goes well the machine will be off by the time
-       the timer expires.
+       the timer expires. If the device wants a different
+       timeout, use that value instead of 30 seconds.
      */
+#define RESTART_NODE_PATH    "/chosen"
+    node = IORegistryEntry::fromPath( RESTART_NODE_PATH, gIODTPlane );
+    if ( node ) {
+      data = OSDynamicCast( OSData, node->getProperty( "halt-restart-timeout" ) );
+      if ( data && data->getLength() == 4 )
+        timeout = *((uint32_t *) data->getBytesNoCopy());
+    }
+
     shutdown_hang = thread_call_allocate( &IOShutdownNotificationsTimedOut, 
-                        (thread_call_param_t) type);
-    clock_interval_to_deadline( 30, kSecondScale, &deadline );
+                        (thread_call_param_t)(uintptr_t) type);
+    clock_interval_to_deadline( timeout, kSecondScale, &deadline );
     thread_call_enter1_delayed( shutdown_hang, 0, deadline );
 
     pmRootDomain->handlePlatformHaltRestart(type); 
@@ -898,7 +892,7 @@ boolean_t PEReadNVRAMProperty(const char *symbol, void *value,
 
     *len  = data->getLength();
     vlen  = min(vlen, *len);
-    if (vlen)
+    if (value && vlen)
         memcpy((void *) value, data->getBytesNoCopy(), vlen);
 
     return TRUE;
@@ -945,18 +939,63 @@ err:
 }
 
 
+boolean_t PERemoveNVRAMProperty(const char *symbol)
+{
+    const OSSymbol *sym;
+
+    if (!symbol)
+        goto err;
+
+    if (init_gIOOptionsEntry() < 0)
+        goto err;
+
+    sym = OSSymbol::withCStringNoCopy(symbol);
+    if (!sym)
+        goto err;
+
+    gIOOptionsEntry->removeProperty(sym);
+
+    sym->release();
+
+    gIOOptionsEntry->sync();
+    return TRUE;
+
+err:
+    return FALSE;
+
+}
+
 long PEGetGMTTimeOfDay(void)
 {
-	long	result = 0;
+    clock_sec_t     secs;
+    clock_usec_t    usecs;
 
-	if( gIOPlatform)		result = gIOPlatform->getGMTTimeOfDay();
-
-	return (result);
+    PEGetUTCTimeOfDay(&secs, &usecs);
+    return secs;
 }
 
 void PESetGMTTimeOfDay(long secs)
 {
-    if( gIOPlatform)		gIOPlatform->setGMTTimeOfDay(secs);
+    PESetUTCTimeOfDay(secs, 0);
+}
+
+void PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+{
+    clock_nsec_t    nsecs = 0;
+
+    *secs = 0;
+	if (gIOPlatform)
+        gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+
+    assert(nsecs < NSEC_PER_SEC);
+    *usecs = nsecs / NSEC_PER_USEC;
+}
+
+void PESetUTCTimeOfDay(clock_sec_t secs, clock_usec_t usecs)
+{
+    assert(usecs < USEC_PER_SEC);
+	if (gIOPlatform)
+        gIOPlatform->setUTCTimeOfDay(secs, usecs * NSEC_PER_USEC);
 }
 
 } /* extern "C" */
@@ -968,41 +1007,6 @@ void IOPlatformExpert::registerNVRAMController(IONVRAMController * caller)
     OSString *        string = 0;
     uuid_string_t     uuid;
 
-#if CONFIG_EMBEDDED
-    entry = IORegistryEntry::fromPath( "/chosen", gIODTPlane );
-    if ( entry )
-    {
-        OSData * data1;
-
-        data1 = OSDynamicCast( OSData, entry->getProperty( "unique-chip-id" ) );
-        if ( data1 && data1->getLength( ) == 8 )
-        {
-            OSData * data2;
-
-            data2 = OSDynamicCast( OSData, entry->getProperty( "chip-id" ) );
-            if ( data2 && data2->getLength( ) == 4 )
-            {
-                SHA1_CTX     context;
-                uint8_t      digest[ SHA_DIGEST_LENGTH ];
-                const uuid_t space = { 0xA6, 0xDD, 0x4C, 0xCB, 0xB5, 0xE8, 0x4A, 0xF5, 0xAC, 0xDD, 0xB6, 0xDC, 0x6A, 0x05, 0x42, 0xB8 };
-
-                SHA1Init( &context );
-                SHA1Update( &context, space, sizeof( space ) );
-                SHA1Update( &context, data1->getBytesNoCopy( ), data1->getLength( ) );
-                SHA1Update( &context, data2->getBytesNoCopy( ), data2->getLength( ) );
-                SHA1Final( digest, &context );
-
-                digest[ 6 ] = ( digest[ 6 ] & 0x0F ) | 0x50;
-                digest[ 8 ] = ( digest[ 8 ] & 0x3F ) | 0x80;
-
-                uuid_unparse( digest, uuid );
-                string = OSString::withCString( uuid );
-            }
-        }
-
-        entry->release( );
-    }
-#else /* !CONFIG_EMBEDDED */
     entry = IORegistryEntry::fromPath( "/efi/platform", gIODTPlane );
     if ( entry )
     {
@@ -1027,7 +1031,6 @@ void IOPlatformExpert::registerNVRAMController(IONVRAMController * caller)
 
         entry->release( );
     }
-#endif /* !CONFIG_EMBEDDED */
 
     if ( string == 0 )
     {
@@ -1402,7 +1405,6 @@ IOPlatformExpertDevice::initWithArgs(
                             void * dtTop, void * p2, void * p3, void * p4 )
 {
     IORegistryEntry * 	dt = 0;
-    void *		argsData[ 4 ];
     bool		ok;
 
     // dtTop may be zero on non- device tree systems
@@ -1414,16 +1416,10 @@ IOPlatformExpertDevice::initWithArgs(
     if( !ok)
 	return( false);
 
+    reserved = NULL;
     workLoop = IOWorkLoop::workLoop();
     if (!workLoop)
         return false;
-
-    argsData[ 0 ] = dtTop;
-    argsData[ 1 ] = p2;
-    argsData[ 2 ] = p3;
-    argsData[ 3 ] = p4;
-
-    setProperty("IOPlatformArgs", (void *)argsData, sizeof(argsData));
 
     return( true);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2011 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2000-2013 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -78,6 +78,10 @@
 #include <libkern/OSAtomic.h>
 #include <sys/kdebug.h>
 
+#if !MACH_KDP
+#include <kdp/kdp_callout.h>
+#endif /* !MACH_KDP */
+
 #if 0
 
 #undef KERNEL_DEBUG
@@ -98,7 +102,7 @@ extern void		mapping_set_ref(ppnum_t pn);
 extern void		ovbcopy(const char	*from,
 				char		*to,
 				vm_size_t	nbytes);
-void machine_callstack(natural_t *buf, vm_size_t callstack_max);
+void machine_callstack(uintptr_t *buf, vm_size_t callstack_max);
 
 
 #define value_64bit(value)  ((value) & 0xFFFFFFFF00000000ULL)
@@ -246,14 +250,14 @@ ovbcopy(
 static inline unsigned int
 ml_phys_read_data(pmap_paddr_t paddr, int size)
 {
-	unsigned int result;
+	unsigned int result = 0;
+	unsigned char s1;
+	unsigned short s2;
 
 	if (!physmap_enclosed(paddr))
 		panic("%s: 0x%llx out of bounds\n", __FUNCTION__, paddr);
 
         switch (size) {
-		unsigned char s1;
-		unsigned short s2;
         case 1:
 		s1 = *(volatile unsigned char *)PHYSMAP_PTOV(paddr);
 		result = s1;
@@ -487,6 +491,13 @@ memcmp(const void *s1, const void *s2, size_t n)
 	return (0);
 }
 
+void *
+memmove(void *dst, const void *src, size_t ulen)
+{
+	bcopy(src, dst, ulen);
+	return dst;
+}
+
 /*
  * Abstract:
  * strlen returns the number of characters in "string" preceeding
@@ -519,7 +530,7 @@ hw_compare_and_store(uint32_t oldval, uint32_t newval, volatile uint32_t *dest)
  * levels of return pc information.
  */
 void machine_callstack(
-	__unused natural_t	*buf,
+	__unused uintptr_t	*buf,
 	__unused vm_size_t	callstack_max)
 {
 }
@@ -538,18 +549,6 @@ void fillPage(ppnum_t pa, unsigned int fill)
 		*addr++ = fill;
 }
 
-static inline void __sfence(void)
-{
-    __asm__ volatile("sfence");
-}
-static inline void __mfence(void)
-{
-    __asm__ volatile("mfence");
-}
-static inline void __wbinvd(void)
-{
-    __asm__ volatile("wbinvd");
-}
 static inline void __clflush(void *ptr)
 {
 	__asm__ volatile("clflush (%0)" : : "r" (ptr));
@@ -560,14 +559,14 @@ void dcache_incoherent_io_store64(addr64_t pa, unsigned int count)
 	addr64_t  linesize = cpuid_info()->cache_linesize;
 	addr64_t  bound = (pa + count + linesize - 1) & ~(linesize - 1);
 
-	__mfence();
+	mfence();
 
 	while (pa < bound) {
 		__clflush(PHYSMAP_PTOV(pa));
 		pa += linesize;
 	}
 
-	__mfence();
+	mfence();
 }
 
 void dcache_incoherent_io_flush64(addr64_t pa, unsigned int count)
@@ -584,12 +583,12 @@ flush_dcache64(addr64_t addr, unsigned count, int phys)
 	else {
 		uint64_t  linesize = cpuid_info()->cache_linesize;
 		addr64_t  bound = (addr + count + linesize -1) & ~(linesize - 1);
-		__mfence();
+		mfence();
 		while (addr < bound) {
 			__clflush((void *) (uintptr_t) addr);
 			addr += linesize;
 		}
-		__mfence();
+		mfence();
 	}
 }
 
@@ -615,15 +614,22 @@ mapping_set_ref(ppnum_t pn)
   pmap_set_reference(pn);
 }
 
+extern i386_cpu_info_t	cpuid_cpu_info;
 void
 cache_flush_page_phys(ppnum_t pa)
 {
 	boolean_t	istate;
 	unsigned char	*cacheline_addr;
-	int		cacheline_size = cpuid_info()->cache_linesize;
-	int		cachelines_to_flush = PAGE_SIZE/cacheline_size;
+	i386_cpu_info_t	*cpuid_infop = cpuid_info();
+	int		cacheline_size;
+	int		cachelines_to_flush;
 
-	__mfence();
+	cacheline_size = cpuid_infop->cache_linesize;
+	if (cacheline_size == 0)
+		panic("cacheline_size=0 cpuid_infop=%p\n", cpuid_infop);
+	cachelines_to_flush = PAGE_SIZE/cacheline_size;
+
+	mfence();
 
 	istate = ml_set_interrupts_enabled(FALSE);
 
@@ -635,30 +641,17 @@ cache_flush_page_phys(ppnum_t pa)
 
 	(void) ml_set_interrupts_enabled(istate);
 
-	__mfence();
+	mfence();
 }
 
 
 #if !MACH_KDP
 void
-kdp_register_callout(void)
+kdp_register_callout(kdp_callout_fn_t fn, void *arg)
 {
+#pragma unused(fn,arg)
 }
 #endif
-
-/*
- * Return a uniformly distributed 64-bit random number.
- *
- * This interface should have minimal dependencies on kernel
- * services, and thus be available very early in the life
- * of the kernel.  But as a result, it may not be very random
- * on all platforms.
- */
-uint64_t
-early_random(void)
-{
-	return (ml_early_random());
-}
 
 #if !CONFIG_VMX
 int host_vmxon(boolean_t exclusive __unused)

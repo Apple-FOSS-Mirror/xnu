@@ -78,11 +78,13 @@ _gPEClockFrequencyInfo
 _gPESerialBaud
 _get_bsdtask_info
 _get_task_map
+_get_task_pmap
 _getsectdatafromheader
 _hfs_getconverter
 _hfs_pickencoding
 _hfs_relconverter
 _host_get_special_port
+_host_get_exception_ports
 _host_priv_self
 _hz
 _ipc_kernel_map
@@ -159,10 +161,12 @@ _sleep
 _stack_privilege
 _task_get_special_port
 _task_resume
+_task_resume2
 _task_suspend
-_thread_notrigger
+_task_suspend2
 _thread_tid
 _tsleep
+_ubc_cs_blob_get
 _vfs_context_current
 _vfs_update_vfsstat
 _vm_allocate
@@ -171,6 +175,7 @@ _vm_map
 _vm_map_deallocate
 _vm_map_unwire
 _vm_map_wire
+_set_vm_privilege
 _vm_protect
 _vm_region
 _vm_region_object_create
@@ -181,3 +186,4 @@ _vnop_kqfilt_add_desc
 _vnop_kqfilt_remove_desc
 _vnop_makenamedstream_desc
 _vnop_removenamedstream_desc
+

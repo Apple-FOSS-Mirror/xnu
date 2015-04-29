@@ -30,8 +30,10 @@
 
 #include <sys/cdefs.h>
 
+#ifdef KERNEL
 #include <IOKit/IOInterrupts.h>
 #include <kern/kern_types.h>
+#endif
 
 __BEGIN_DECLS
 #include <mach/boolean.h>
@@ -56,6 +58,15 @@ void PE_enter_debugger(
 void PE_init_platform(
 	boolean_t vm_initialized, 
 	void *args);
+
+/*
+ * Copies the requested number of bytes from the "random-seed" property in
+ * the device tree, and zeros the corresponding bytes in the device tree.
+ * Returns the number of bytes actually copied.
+ */
+uint32_t PE_get_random_seed(
+	unsigned char * dst_random_seed,
+	uint32_t request_size);
 
 
 void PE_init_kprintf(
@@ -118,9 +129,11 @@ void PE_register_timebase_callback(timebase_callback_func callback);
 
 void PE_call_timebase_callback(void);
 
+#ifdef KERNEL
 void PE_install_interrupt_handler(
 	void *nub, int source,
         void *target, IOInterruptHandler handler, void *refCon);
+#endif
 
 #ifndef _FN_KPRINTF
 #define	_FN_KPRINTF
@@ -221,6 +234,7 @@ extern int PE_initialize_console(
 #define kPEEnableScreen	 	6
 #define kPEDisableScreen	7
 #define kPEBaseAddressChange	8
+#define kPERefreshBootGraphics	9
 
 extern void PE_display_icon( unsigned int flags,
 			     const char * name );

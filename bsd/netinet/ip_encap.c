@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2011 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -90,6 +90,7 @@
 #include <sys/mbuf.h>
 #include <sys/mcache.h>
 #include <sys/errno.h>
+#include <sys/domain.h>
 #include <sys/protosw.h>
 #include <sys/queue.h>
 
@@ -101,9 +102,6 @@
 #include <netinet/ip.h>
 #include <netinet/ip_var.h>
 #include <netinet/ip_encap.h>
-#if MROUTING
-#include <netinet/ip_mroute.h>
-#endif /* MROUTING */
 
 #if INET6
 #include <netinet/ip6.h>
@@ -120,6 +118,7 @@
 MALLOC_DEFINE(M_NETADDR, "Export Host", "Export host address structure");
 #endif
 
+static void encap_init(struct protosw *, struct domain *);
 static void encap_add(struct encaptab *);
 static int mask_match(const struct encaptab *, const struct sockaddr *,
 		const struct sockaddr *);
@@ -132,14 +131,18 @@ LIST_HEAD(, encaptab) encaptab;
 LIST_HEAD(, encaptab) encaptab = LIST_HEAD_INITIALIZER(&encaptab);
 #endif
 
-void
-encap_init()
+static void
+encap_init(struct protosw *pp, struct domain *dp)
 {
-	static int initialized = 0;
+#pragma unused(dp)
+	static int encap_initialized = 0;
 
-	if (initialized)
+	VERIFY((pp->pr_flags & (PR_INITIALIZED|PR_ATTACHED)) == PR_ATTACHED);
+
+	/* This gets called by more than one protocols, so initialize once */
+	if (encap_initialized)
 		return;
-	initialized++;
+	encap_initialized = 1;
 #if 0
 	/*
 	 * we cannot use LIST_INIT() here, since drivers may want to call
@@ -150,6 +153,18 @@ encap_init()
 	 */
 	LIST_INIT(&encaptab);
 #endif
+}
+
+void
+encap4_init(struct protosw *pp, struct domain *dp)
+{
+	encap_init(pp, dp);
+}
+
+void
+encap6_init(struct ip6protosw *pp, struct domain *dp)
+{
+	encap_init((struct protosw *)pp, dp);
 }
 
 #if INET
@@ -243,18 +258,6 @@ encap4_input(m, off)
 			m_freem(m);
 		return;
 	}
-
-	/* for backward compatibility */
-# if MROUTING
-#  define COMPATFUNC	ipip_input
-# endif /*MROUTING*/
-
-#if COMPATFUNC
-	if (proto == IPPROTO_IPV4) {
-		COMPATFUNC(m, off);
-		return;
-	}
-#endif
 
 	/* last resort: inject to raw socket */
 	rip_input(m, off);

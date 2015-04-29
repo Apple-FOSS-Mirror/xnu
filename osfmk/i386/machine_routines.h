@@ -78,9 +78,11 @@ void ml_install_interrupt_handler(
     IOInterruptHandler handler,
     void *refCon);
 
-void ml_get_timebase(unsigned long long *timestamp);
+void ml_entropy_collect(void);
+
+uint64_t ml_get_timebase();
 void ml_init_lock_timeout(void); 
-void ml_init_delay_spin_threshold(void);
+void ml_init_delay_spin_threshold(int);
 
 boolean_t ml_delay_should_spin(uint64_t interval);
 
@@ -103,6 +105,9 @@ vm_offset_t ml_vtophys(
 vm_size_t ml_nofault_copy(
 	vm_offset_t virtsrc, vm_offset_t virtdst, vm_size_t size);
 
+boolean_t ml_validate_nofault(
+	vm_offset_t virtsrc, vm_size_t size);
+
 /* Machine topology info */
 uint64_t ml_cpu_cache_size(unsigned int level);	
 uint64_t ml_cpu_cache_sharing(unsigned int level);	
@@ -117,6 +122,14 @@ extern void	ml_cpu_down(void);
 void bzero_phys_nc(
 				   addr64_t phys_address,
 				   uint32_t length);
+extern uint32_t interrupt_timer_coalescing_enabled;
+extern uint32_t idle_entry_timer_processing_hdeadline_threshold;
+
+#if TCOAL_INSTRUMENT
+#define TCOAL_DEBUG KERNEL_DEBUG_CONSTANT
+#else
+#define TCOAL_DEBUG(x, a, b, c, d, e) do { } while(0)
+#endif /* TCOAL_INSTRUMENT */
 
 #if	defined(PEXPERT_KERNEL_PRIVATE) || defined(MACH_KERNEL_PRIVATE)
 /* IO memory map services */
@@ -312,6 +325,15 @@ boolean_t ml_fpu_avx_enabled(void);
 void interrupt_latency_tracker_setup(void);
 void interrupt_reset_latency_stats(void);
 void interrupt_populate_latency_stats(char *, unsigned);
+void ml_get_power_state(boolean_t *, boolean_t *);
 
+void timer_queue_expire_local(void*);
+void timer_queue_expire_rescan(void*);
+void ml_timer_evaluate(void);
+boolean_t ml_timer_forced_evaluation(void);
+
+void ml_gpu_stat_update(uint64_t);
+uint64_t ml_gpu_stat(thread_t);
+boolean_t ml_recent_wake(void);
 #endif /* XNU_KERNEL_PRIVATE */
 #endif /* _I386_MACHINE_ROUTINES_H_ */

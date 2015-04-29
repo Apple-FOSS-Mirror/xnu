@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010-2011 Apple Inc. All rights reserved.
+ * Copyright (c) 2010-2014 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -58,7 +58,7 @@
 int tcp_ledbat_init(struct tcpcb *tp);
 int tcp_ledbat_cleanup(struct tcpcb *tp);
 void tcp_ledbat_cwnd_init(struct tcpcb *tp);
-void tcp_ledbat_inseq_ack_rcvd(struct tcpcb *tp, struct tcphdr *th);
+void tcp_ledbat_congestion_avd(struct tcpcb *tp, struct tcphdr *th);
 void tcp_ledbat_ack_rcvd(struct tcpcb *tp, struct tcphdr *th);
 void tcp_ledbat_pre_fr(struct tcpcb *tp);
 void tcp_ledbat_post_fr(struct tcpcb *tp, struct tcphdr *th);
@@ -72,7 +72,7 @@ struct tcp_cc_algo tcp_cc_ledbat = {
 	.init = tcp_ledbat_init,
 	.cleanup = tcp_ledbat_cleanup,
 	.cwnd_init = tcp_ledbat_cwnd_init,
-	.inseq_ack_rcvd = tcp_ledbat_inseq_ack_rcvd,
+	.congestion_avd = tcp_ledbat_congestion_avd,
 	.ack_rcvd = tcp_ledbat_ack_rcvd,
 	.pre_fr = tcp_ledbat_pre_fr,
 	.post_fr = tcp_ledbat_post_fr,
@@ -81,10 +81,6 @@ struct tcp_cc_algo tcp_cc_ledbat = {
 	.delay_ack = tcp_ledbat_delay_ack,
 	.switch_to = tcp_ledbat_switch_cc
 };
-
-extern int tcp_do_rfc3465;
-extern int tcp_do_rfc3465_lim2;
-extern uint32_t get_base_rtt(struct tcpcb *tp);
 
 /* Target queuing delay in milliseconds. This includes the processing 
  * and scheduling delay on both of the end-hosts. A LEDBAT sender tries 
@@ -108,15 +104,15 @@ SYSCTL_INT(_net_inet_tcp, OID_AUTO, bg_target_qdelay, CTLFLAG_RW | CTLFLAG_LOCKE
  * max_allowed_cwnd = allowed_increase + (tether * flight_size)
  * cwnd = min(cwnd, max_allowed_cwnd)
  *
- * 'Allowed_increase' parameter is set to 2. If the flight size is zero, then
- * we want the congestion window to be at least 2 packets to reduce the
- * delay induced by delayed ack. This helps when the receiver is acking every
- * other packet.
+ * 'Allowed_increase' parameter is set to 8. If the flight size is zero, then
+ * we want the congestion window to be at least 8 packets to reduce the
+ * delay induced by delayed ack. This helps when the receiver is acking 
+ * more than 2 packets at a time (stretching acks for better performance).
  * 
  * 'Tether' is also set to 2. We do not want this to limit the growth of cwnd
  * during slow-start.
  */ 
-int allowed_increase = 2;
+int allowed_increase = 8;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, bg_allowed_increase, CTLFLAG_RW | CTLFLAG_LOCKED, 
 	&allowed_increase, 1, "Additive constant used to calculate max allowed congestion window");
 
@@ -224,11 +220,11 @@ tcp_ledbat_cwnd_init(struct tcpcb *tp) {
  * This gets called only during congestion avoidance phase.
  */
 void
-tcp_ledbat_inseq_ack_rcvd(struct tcpcb *tp, struct tcphdr *th) {
+tcp_ledbat_congestion_avd(struct tcpcb *tp, struct tcphdr *th) {
 	int acked = 0;
 	u_int32_t incr = 0;
 
-	acked = th->th_ack - tp->snd_una;
+	acked = BYTES_ACKED(th, tp);
 	tp->t_bytes_acked += acked;
 	if (tp->t_bytes_acked > tp->snd_cwnd) {
 		tp->t_bytes_acked -= tp->snd_cwnd;
@@ -260,7 +256,7 @@ tcp_ledbat_ack_rcvd(struct tcpcb *tp, struct tcphdr *th) {
 	register u_int incr = tp->t_maxseg;
 	int acked = 0;
 
-	acked = th->th_ack - tp->snd_una;
+	acked = BYTES_ACKED(th, tp);
 	tp->t_bytes_acked += acked;
 	if (cw >= tp->bg_ssthresh) {
 		/* congestion-avoidance */
@@ -318,9 +314,13 @@ tcp_ledbat_post_fr(struct tcpcb *tp, struct tcphdr *th) {
 	 * snd_ssthresh outstanding data.  But in case we
 	 * would be inclined to send a burst, better to do
 	 * it via the slow start mechanism.
+	 *
+	 * If the flight size is zero, then make congestion 
+	 * window to be worth at least 2 segments to avoid 
+	 * delayed acknowledgement (draft-ietf-tcpm-rfc3782-bis-05).
 	 */
 	if (ss < (int32_t)tp->snd_ssthresh)
-		tp->snd_cwnd = ss + tp->t_maxseg;
+		tp->snd_cwnd = max(ss, tp->t_maxseg) + tp->t_maxseg;
 	else
 		tp->snd_cwnd = tp->snd_ssthresh;
 	tp->t_bytes_acked = 0;
@@ -358,6 +358,9 @@ tcp_ledbat_after_idle(struct tcpcb *tp) {
 	
 	/* Reset the congestion window */
 	tp->snd_cwnd = tp->t_maxseg * bg_ss_fltsz;
+
+	/* If stretch ack was auto disabled, re-evaluate the situation */
+	tcp_cc_after_idle_stretchack(tp);
 }
 
 /* Function to change the congestion window when the retransmit 
@@ -373,14 +376,12 @@ tcp_ledbat_after_timeout(struct tcpcb *tp) {
 		u_int win = min(tp->snd_wnd, tp->snd_cwnd) / 2 / tp->t_maxseg;
 		if (win < 2)
 			win = 2;
-		tp->snd_cwnd = tp->t_maxseg;
 		tp->snd_ssthresh = win * tp->t_maxseg;
-		tp->t_bytes_acked = 0;
-		tp->t_dupacks = 0;
 
 		if (tp->bg_ssthresh > tp->snd_ssthresh)
 			tp->bg_ssthresh = tp->snd_ssthresh;
 
+		tp->snd_cwnd = tp->t_maxseg;
 		tcp_cc_resize_sndbuf(tp);
 	}
 }
@@ -401,6 +402,12 @@ tcp_ledbat_after_timeout(struct tcpcb *tp) {
 
 int
 tcp_ledbat_delay_ack(struct tcpcb *tp, struct tcphdr *th) {
+	/* If any flag other than TH_ACK is set, set "end-of-write" bit */
+	if (th->th_flags & ~TH_ACK)
+		tp->t_flagsext |= TF_STREAMEOW;
+	else
+		tp->t_flagsext &= ~(TF_STREAMEOW);
+
 	if ((tp->t_flags & TF_RXWIN0SENT) == 0 &&
 		(th->th_flags & TH_PUSH) == 0 &&
 		(tp->t_unacksegs == 1))

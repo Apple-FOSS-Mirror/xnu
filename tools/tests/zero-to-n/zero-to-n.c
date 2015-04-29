@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <sys/wait.h>
+#include <sys/param.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/ptrace.h>
@@ -37,7 +38,13 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <err.h>
 #include <string.h>
+
+#include <spawn.h>
+#include <spawn_private.h>
+#include <sys/spawn_internal.h>
+#include <mach-o/dyld.h>
 
 #include <libkern/OSAtomic.h>
 
@@ -64,9 +71,10 @@ typedef enum my_policy_type { MY_POLICY_REALTIME, MY_POLICY_TIMESHARE, MY_POLICY
 /* Declarations */
 void* 			child_thread_func(void *arg);
 void			print_usage();
-int			thread_setup();
+int			thread_setup(int my_id);
 my_policy_type_t	parse_thread_policy(const char *str);
 int			thread_finish_iteration();
+void			selfexec_with_apptype(int argc, char *argv[]);
 
 /* Global variables (general) */
 int			g_numthreads;
@@ -79,6 +87,7 @@ uint64_t 		*g_thread_endtimes_abs;
 volatile int32_t 	g_done_threads;
 boolean_t		g_do_spin = FALSE;
 boolean_t		g_verbose = FALSE;
+boolean_t		g_do_affinity = FALSE;
 uint64_t	 	g_starttime_abs;
 #if MIMIC_DIGI_LEAD_TIME
 int			g_long_spinid;
@@ -144,14 +153,15 @@ parse_wakeup_pattern(const char *str)
  * Set policy
  */
 int
-thread_setup()
+thread_setup(int my_id)
 {
 	int res;
 
 	switch (g_policy) {
 		case MY_POLICY_TIMESHARE:
 		{
-			return 0;
+			res = KERN_SUCCESS;
+			break;
 		}
 		case MY_POLICY_REALTIME: 
 		{
@@ -181,6 +191,15 @@ thread_setup()
 			printf("invalid policy type\n");
 			return 1;
 		}
+	}
+
+	if (g_do_affinity) {
+		thread_affinity_policy_data_t affinity;
+
+		affinity.affinity_tag = my_id % 2;
+
+		res = thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY, (thread_policy_t)&affinity, THREAD_AFFINITY_POLICY_COUNT);
+		assert(res == 0, fail);
 	}
 
 	return 0;
@@ -230,12 +249,14 @@ thread_finish_iteration(int id)
 		debug_log("Thread %p signalling main thread.\n", pthread_self());
 		res = semaphore_signal(g_main_sem);
 	} else {
+#ifndef MIMIC_DIGI_LEAD_TIME
 		if (g_do_spin) {
 			while (g_done_threads < g_numthreads) {
 				y = y + 1.5 + x;
 				x = sqrt(y);
 			}
 		}
+#endif
 	}
 
 	return res;
@@ -254,13 +275,11 @@ child_thread_func(void *arg)
 	int32_t new;
 
 	/* Set policy and so forth */
-	thread_setup();
+	thread_setup(my_id);
 
 	/* Tell main thread when everyone has set up */
 	new = OSAtomicIncrement32(&g_done_threads);
-	if (new == g_numthreads) {
-		semaphore_signal(g_main_sem);
-	}
+	semaphore_signal(g_main_sem);
 
 	/* For each iteration */
 	for (i = 0; i < g_iterations; i++) {
@@ -351,7 +370,7 @@ fail:
 void
 print_usage()
 {
-	printf("Usage: zn <num threads> <chain | broadcast-single-sem | broadcast-per-thread> <realtime | timeshare | fixed> <num iterations> [-trace  <traceworthy latency in ns>] [-spin] [-verbose]\n");
+	printf("Usage: zn <num threads> <chain | broadcast-single-sem | broadcast-per-thread> <realtime | timeshare | fixed> <num iterations> [-trace  <traceworthy latency in ns>] [-spin] [-affinity] [-verbose]\n");
 }
 
 /*
@@ -401,10 +420,11 @@ main(int argc, char **argv)
 	uint64_t	max, min;
 	uint64_t	traceworthy_latency_ns = TRACEWORTHY_NANOS;
 	float		avg, stddev;
+	boolean_t	seen_apptype = FALSE;
 
 	srand(time(NULL));
 
-	if (argc < 5 || argc > 9) {
+	if (argc < 5 || argc > 10) {
 		print_usage();
 		goto fail;
 	}
@@ -430,10 +450,18 @@ main(int argc, char **argv)
 		} else if ((strcmp(argv[i], "-trace") == 0) && 
 				(i < (argc - 1))) {
 			traceworthy_latency_ns = strtoull(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "-affinity") == 0) {
+			g_do_affinity = TRUE;
+		} else if (strcmp(argv[i], "-switched_apptype") == 0) {
+			seen_apptype = TRUE;
 		} else {
 			print_usage();
 			goto fail;
 		}
+	}
+
+	if (!seen_apptype) {
+		selfexec_with_apptype(argc, argv);
 	}
 
 	mach_timebase_info(&g_mti);
@@ -482,9 +510,32 @@ main(int argc, char **argv)
 		assert(res == 0, fail);
 	}
 
+	res = setpriority(PRIO_DARWIN_ROLE, 0, PRIO_DARWIN_ROLE_UI_FOCAL);
+	assert(res == 0, fail);
+	thread_setup(0);
+
+	/* Switching to fixed pri may have stripped our main thread QoS and priority, so re-instate */
+	if (g_policy == MY_POLICY_FIXEDPRI) {
+		thread_precedence_policy_data_t prec;
+		mach_msg_type_number_t count;
+		boolean_t get_default = FALSE;
+		
+		count = THREAD_PRECEDENCE_POLICY_COUNT;
+		res = thread_policy_get(mach_thread_self(), THREAD_PRECEDENCE_POLICY, (thread_policy_t) &prec, &count, &get_default);
+		assert(res == 0, fail);
+		
+		prec.importance += 16; /* 47 - 31 */
+		res = thread_policy_set(mach_thread_self(), THREAD_PRECEDENCE_POLICY, (thread_policy_t) &prec, THREAD_PRECEDENCE_POLICY_COUNT);
+		assert(res == 0, fail);
+	}
+
 	/* Let everyone get settled */
-	semaphore_wait(g_main_sem);
-	sleep(1);
+	for (i = 0; i < g_numthreads; i++) {
+		res = semaphore_wait(g_main_sem);
+		assert(res == 0, fail);
+	}
+	/* Let worker threads get back to sleep... */
+	usleep(g_numthreads * 10);
 
 	/* Go! */
 	for (i = 0; i < g_iterations; i++) {
@@ -576,4 +627,43 @@ main(int argc, char **argv)
 	return 0;
 fail:
 	return 1;
+}
+
+/*
+ * WARNING: This is SPI specifically intended for use by launchd to start UI
+ * apps. We use it here for a test tool only to opt into QoS using the same
+ * policies. Do not use this outside xnu or libxpc/launchd.
+ */
+void
+selfexec_with_apptype(int argc, char *argv[])
+{
+	int ret;
+	posix_spawnattr_t attr;
+	extern char **environ;
+	char *new_argv[argc + 1 + 1 /* NULL */];
+	int i;
+	char prog[PATH_MAX];
+	int32_t prog_size = PATH_MAX;
+
+	ret = _NSGetExecutablePath(prog, &prog_size);
+	if (ret != 0) err(1, "_NSGetExecutablePath");
+
+	for (i=0; i < argc; i++) {
+		new_argv[i] = argv[i];
+	}
+
+	new_argv[i]   = "-switched_apptype";
+	new_argv[i+1] = NULL;
+
+	ret = posix_spawnattr_init(&attr);
+	if (ret != 0) errc(1, ret, "posix_spawnattr_init");
+
+	ret = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC);
+	if (ret != 0) errc(1, ret, "posix_spawnattr_setflags");
+
+	ret = posix_spawnattr_setprocesstype_np(&attr, POSIX_SPAWN_PROC_TYPE_APP_DEFAULT);
+	if (ret != 0) errc(1, ret, "posix_spawnattr_setprocesstype_np");
+
+	ret = posix_spawn(NULL, prog, NULL, &attr, new_argv, environ);
+	if (ret != 0) errc(1, ret, "posix_spawn");
 }
